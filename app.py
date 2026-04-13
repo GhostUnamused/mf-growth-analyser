@@ -1,0 +1,564 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import requests
+import datetime
+import yfinance as yf
+from duckduckgo_search import DDGS
+
+st.set_page_config(page_title="MF Growth Analyser", layout="wide")
+
+st.title("MF Growth Analyser")
+
+planner_expander = st.expander("Target Wealth Planner (Reverse SIP)")
+with planner_expander:
+    col_g, col_h = st.columns(2)
+    goal_amt = col_g.number_input("Financial Goal (₹)", min_value=10000, value=10000000, step=100000)
+    horizon_yrs = col_h.number_input("Time Horizon (Years)", min_value=1, value=10, step=1)
+    planner_results_placeholder = st.empty()
+
+# --- Constants ---
+BENCHMARKS = {
+    "Nifty 50": "^NSEI", 
+    "BSE Sensex": "^BSESN", 
+    "Nifty 500": "^CRSLDX", 
+    "Nifty Midcap 100": "^NSEMDCP50"
+}
+EXCLUDE_WORDS = ['CLOSED', 'MATURED', 'SUSPENDED', 'IDCW', 'DIVIDEND']
+
+@st.cache_data(ttl=86400)
+def fetch_active_funds():
+    try:
+        res = requests.get('https://www.amfiindia.com/spages/NAVAll.txt', timeout=15)
+        res.raise_for_status()
+        lines = res.text.split('\n')
+        fund_dict = {}
+        for line in lines:
+            parts = line.split(';')
+            if len(parts) >= 6 and parts[0].strip().isdigit():
+                code = parts[0].strip()
+                name = parts[3].strip().upper()
+                if not any(word in name for word in EXCLUDE_WORDS):
+                    fund_dict[name] = code
+        return fund_dict
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=3600)
+def fetch_mf_data(scheme_code):
+    try:
+        res = requests.get(f"https://api.mfapi.in/mf/{scheme_code}")
+        res.raise_for_status()
+        data = res.json()
+        if "data" not in data or not data["data"]:
+            return None
+        df = pd.DataFrame(data["data"])
+        df["Date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
+        df["MF_NAV"] = pd.to_numeric(df["nav"], errors="coerce")
+        df = df.dropna(subset=['MF_NAV']).sort_values("Date").reset_index(drop=True)
+        return df[["Date", "MF_NAV"]]
+    except Exception:
+        return None
+
+@st.cache_data(ttl=3600)
+def fetch_index_data(ticker, start_dt="2000-01-01"):
+    try:
+        df = yf.download(ticker, start=start_dt)
+        if df.empty:
+            return None
+        df = df.reset_index()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df[['Date', 'Close']].copy()
+        
+        if 'Close' in df.columns and isinstance(df['Close'], pd.DataFrame):
+            df['Close'] = df['Close'].iloc[:, 0]
+            
+        df = df.rename(columns={'Close': 'Index_Close'})
+        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+        return df.sort_values('Date').reset_index(drop=True)
+    except Exception:
+        return None
+
+# --- Master Controls (No Sidebar) ---
+col1, col2, col3, col4, col5 = st.columns(5)
+
+with col1:
+    selected_benchmark_name = st.selectbox("Select Benchmark Index", options=list(BENCHMARKS.keys()), index=3)
+    benchmark_ticker = BENCHMARKS[selected_benchmark_name]
+
+with col2:
+    investment_type = st.radio("Investment Type", options=["Lumpsum", "SIP"])
+
+with col3:
+    label = "Monthly SIP Amount (₹)" if investment_type == "SIP" else "Initial Lumpsum (₹)"
+    amount = st.number_input(label, min_value=500, value=10000, step=500)
+
+with col4:
+    if investment_type == "SIP":
+        step_up_pct = st.slider("Yearly Step-Up (%)", min_value=0, max_value=50, value=0, step=1)
+    else:
+        step_up_pct = 0
+
+with col5:
+    apply_taxes_inflation = st.toggle("Adjust for Taxes & Inflation")
+    if apply_taxes_inflation:
+        sub_col1, sub_col2 = st.columns(2)
+        with sub_col1:
+            tax_rate = st.number_input("LTCG Tax (%)", value=12.5, step=0.5)
+        with sub_col2:
+            inflation_rate = st.number_input("Inflation (%)", value=5.5, step=0.5)
+
+all_funds = fetch_active_funds()
+if not all_funds:
+    st.error("Failed to load active funds database.")
+    st.stop()
+
+selected_fund_names = st.multiselect("Select Mutual Funds", options=list(all_funds.keys()), default=[list(all_funds.keys())[0]] if all_funds else [])
+
+if not selected_fund_names:
+    st.info("Please select at least one mutual fund.")
+    st.stop()
+
+
+# --- Data Fetching & Time Sync ---
+with st.spinner("Fetching live portfolio data..."):
+    index_df = fetch_index_data(benchmark_ticker)
+    if index_df is None:
+        st.error("Failed to fetch Index data.")
+        st.stop()
+
+    mf_dfs = {}
+    for fname in selected_fund_names:
+        scode = all_funds[fname]
+        df = fetch_mf_data(scode)
+        if df is not None and not df.empty:
+            df = df.rename(columns={"MF_NAV": fname})
+            mf_dfs[fname] = df
+
+    if not mf_dfs:
+        st.error("Failed to fetch any Mutual Fund data. They may be inactive.")
+        st.stop()
+
+    merged_df = index_df.copy()
+    for fname, df in mf_dfs.items():
+        merged_df = pd.merge(merged_df, df, on="Date", how="outer")
+
+    merged_df = merged_df.sort_values("Date")
+
+    valid_dates_all = merged_df.dropna(subset=['Index_Close'] + list(mf_dfs.keys()), how='all')["Date"]
+    if valid_dates_all.empty:
+        st.warning("No overlapping data found for the selected assets.")
+        st.stop()
+
+    min_date = valid_dates_all.min().date()
+    max_date = merged_df["Date"].max().date()
+
+
+# --- Isolated Target Wealth Planner Logic ---
+planner_data = []
+n_months = horizon_yrs * 12
+
+for asset_name in list(mf_dfs.keys()) + ["Index_Close"]:
+    prices_df = merged_df[['Date', asset_name]].dropna()
+    if len(prices_df) > 2:
+        start_val = prices_df[asset_name].iloc[0]
+        end_val = prices_df[asset_name].iloc[-1]
+        yrs = (prices_df['Date'].iloc[-1] - prices_df['Date'].iloc[0]).days / 365.25
+        
+        c_ret = 0.0
+        if yrs > 0 and start_val > 0:
+            c_ret = ((end_val / start_val) ** (1/yrs) - 1) * 100
+            
+        r_month = ((1 + c_ret/100.0) ** (1/12.0)) - 1
+        if r_month > 0:
+            pmt = (goal_amt * r_month) / (((1 + r_month)**n_months - 1) * (1 + r_month))
+        else:
+            pmt = goal_amt / n_months
+            
+        display_name = selected_benchmark_name if asset_name == "Index_Close" else asset_name
+        planner_data.append({
+            "Asset/Benchmark Name": display_name, 
+            "Historical Max CAGR": f"{c_ret:.2f}%", 
+            "Required Monthly SIP": f"₹ {pmt:,.0f}"
+        })
+
+with planner_results_placeholder.container():
+    st.write("Required investments linked to absolute maximum historical growth bounds:")
+    st.dataframe(pd.DataFrame(planner_data), use_container_width=True, hide_index=True)
+
+
+st.write("---")
+# --- Hybrid Time UI ---
+time_choice = st.radio("Timeframe", ['1M', '6M', 'YTD', '1Y', '3Y', '5Y', '10Y', 'Max', 'Custom'], horizontal=True, index=7)
+
+max_dt_ts = pd.to_datetime(max_date)
+
+if time_choice == '1M':
+    start_dt = max_dt_ts - pd.DateOffset(months=1)
+elif time_choice == '6M':
+    start_dt = max_dt_ts - pd.DateOffset(months=6)
+elif time_choice == 'YTD':
+    start_dt = pd.to_datetime(datetime.date(max_dt_ts.year, 1, 1))
+elif time_choice == '1Y':
+    start_dt = max_dt_ts - pd.DateOffset(years=1)
+elif time_choice == '3Y':
+    start_dt = max_dt_ts - pd.DateOffset(years=3)
+elif time_choice == '5Y':
+    start_dt = max_dt_ts - pd.DateOffset(years=5)
+elif time_choice == '10Y':
+    start_dt = max_dt_ts - pd.DateOffset(years=10)
+elif time_choice == 'Max':
+    start_dt = pd.to_datetime(min_date)
+else:
+    start_dt = pd.to_datetime(min_date)
+
+start_dt = max(start_dt, pd.to_datetime(min_date))
+end_dt = max_dt_ts
+
+if time_choice == 'Custom':
+    selected_dates = st.slider(
+        "Select Custom Date Range",
+        min_value=min_date,
+        max_value=max_date,
+        value=(start_dt.date(), end_dt.date())
+    )
+    start_dt = pd.to_datetime(selected_dates[0])
+    end_dt = pd.to_datetime(selected_dates[1])
+
+
+# --- Strict Nearest Valid Trading Day ---
+valid_start_dates = merged_df[merged_df["Date"] >= start_dt]["Date"]
+if not valid_start_dates.empty:
+    start_dt = valid_start_dates.iloc[0]
+
+# Preserve unadulterated NaN states locally for precision checks
+filtered_df = merged_df[(merged_df["Date"] >= start_dt) & (merged_df["Date"] <= end_dt)].copy().reset_index(drop=True)
+
+if filtered_df.empty:
+    st.warning("No valid trading days found in the selected date range.")
+    st.stop()
+    
+# Render cleanly filled subsets structurally strictly for mathematical plotting boundaries
+sim_df = filtered_df.ffill().bfill()
+
+
+# --- Core Math Simulation ---
+# Draw plotting indices entirely dynamically 
+result_df = sim_df[['Date']].copy()
+total_invested_df = sim_df[['Date']].copy()
+assets = ['Index_Close'] + list(mf_dfs.keys())
+
+if investment_type == "Lumpsum":
+    for asset in assets:
+        total_invested_df[asset] = amount
+        # Base value relies on actual existing trace boundaries natively
+        valid_history = filtered_df[asset].dropna()
+        base_val = valid_history.iloc[0] if not valid_history.empty else sim_df[asset].iloc[0]
+        
+        if pd.isna(base_val) or base_val == 0:
+            result_df[asset] = None
+        else:
+            result_df[asset] = (sim_df[asset] / base_val) * amount
+
+elif investment_type == "SIP":
+    sim_df['YearMonth'] = sim_df['Date'].dt.to_period('M')
+    buy_dates_idx = sim_df.groupby('YearMonth')['Date'].idxmin()
+    
+    for asset in assets:
+        units_bought = np.zeros(len(sim_df))
+        invested_tracking = np.zeros(len(sim_df))
+        asset_prices = sim_df[asset].values
+        
+        month_count = 0
+        for i, b_idx in enumerate(buy_dates_idx.index):
+            row_idx = buy_dates_idx[b_idx]
+            years_passed = month_count // 12
+            current_sip_amount = amount * ((1 + step_up_pct / 100.0) ** years_passed)
+            
+            price = asset_prices[row_idx]
+            if not np.isnan(price) and price > 0:
+                units_bought[row_idx] = np.round(current_sip_amount / price, 4)
+            invested_tracking[row_idx] = current_sip_amount
+            month_count += 1
+            
+        cumulative_units = np.cumsum(units_bought)
+        cumulative_invested = np.cumsum(invested_tracking)
+        
+        result_df[asset] = cumulative_units * asset_prices
+        total_invested_df[asset] = cumulative_invested
+
+# --- Tax / Inflation Adjustments ---
+if apply_taxes_inflation:
+    date_diff_years = (result_df['Date'] - result_df['Date'].iloc[0]).dt.days / 365.25
+    date_diff_years = date_diff_years.replace(0, 0.0001)
+    
+    for asset in assets:
+        gross_profit = result_df[asset] - total_invested_df[asset]
+        taxable_profit = (gross_profit - 125000).clip(lower=0)
+        tax_amount = taxable_profit * (tax_rate / 100.0)
+        
+        post_tax_value = result_df[asset] - tax_amount
+        real_value = post_tax_value / ((1 + (inflation_rate / 100.0)) ** date_diff_years)
+        result_df[asset] = real_value
+
+
+# --- Universal Callbacks and Data Prep ---
+tab_perf, tab_risk, tab_news = st.tabs(["Performance", "Risk & Consistency", "Market News"])
+
+def calc_return(invested, final_val, yrs):
+    if yrs <= 0 or invested <= 0:
+        return 0.0
+    return ((final_val / invested) ** (1/yrs) - 1) * 100
+
+def calc_abs_return(invested, final_val):
+    if invested <= 0:
+        return 0.0
+    return ((final_val - invested) / invested) * 100
+
+def color_formatting(val):
+    if pd.isna(val) or val == "-":
+        return ''
+    try:
+        if float(val) > 0:
+            return 'color: #00FF00;'
+        elif float(val) < 0:
+            return 'color: #FF0000;'
+    except:
+        pass
+    return 'color: gray;'
+
+def get_true_metrics(asset_col):
+    """ Extract exact metrics securely bypassing global forward-fill extrapolation bounds natively """
+    valid_series = filtered_df[asset_col].dropna()
+    if valid_series.empty:
+        return 0.0, 0.0, 0.0001
+        
+    last_valid_idx = valid_series.index[-1]
+    first_valid_idx = valid_series.index[0]
+    
+    final_val = result_df[asset_col].loc[last_valid_idx]
+    invest_val = total_invested_df[asset_col].loc[last_valid_idx]
+    
+    true_elapsed = (filtered_df['Date'].loc[last_valid_idx] - filtered_df['Date'].loc[first_valid_idx]).days / 365.25
+    if true_elapsed <= 0:
+        true_elapsed = 0.0001
+        
+    return final_val, invest_val, true_elapsed
+
+benchmark_final, benchmark_invested, bm_years = get_true_metrics('Index_Close')
+benchmark_ret = calc_return(benchmark_invested, benchmark_final, bm_years) if benchmark_invested > 0 else 0.0
+benchmark_abs_ret = calc_abs_return(benchmark_invested, benchmark_final) if benchmark_invested > 0 else 0.0
+
+bm_metrics_data = [{
+    "Asset Name": selected_benchmark_name,
+    "Total Invested (₹)": benchmark_invested,
+    "Final Value (₹)": benchmark_final,
+    "Absolute Return (%)": benchmark_abs_ret,
+    "Annualized Return (%)": benchmark_ret,
+    "Outperformance (%)": np.nan
+}]
+
+fund_metrics_data = []
+
+for fname in mf_dfs.keys():
+    fund_final, fund_invested, fund_years = get_true_metrics(fname)
+    
+    if fund_final == 0:
+        continue
+        
+    fund_ret = calc_return(fund_invested, fund_final, fund_years)
+    fund_abs_ret = calc_abs_return(fund_invested, fund_final)
+    outperf = fund_ret - benchmark_ret
+    
+    fund_metrics_data.append({
+        "Asset Name": fname,
+        "Total Invested (₹)": fund_invested,
+        "Final Value (₹)": fund_final,
+        "Absolute Return (%)": fund_abs_ret,
+        "Annualized Return (%)": fund_ret,
+        "Outperformance (%)": outperf
+    })
+
+# --- TAB 1: PERFORMANCE ---
+with tab_perf:
+    st.subheader("Performance Scorecards")
+    cols = st.columns(len(assets))
+    with cols[0]:
+        st.metric(
+            label=f"{selected_benchmark_name} (Benchmark)", 
+            value=f"₹ {benchmark_final:,.0f}", 
+            delta=f"{benchmark_abs_ret:.2f}%"
+        )
+        
+    for idx, fname in enumerate(mf_dfs.keys(), start=1):
+        f_final, f_inv, f_yrs = get_true_metrics(fname)
+        f_abs_ret = calc_abs_return(f_inv, f_final)
+        
+        if idx < len(cols):
+            with cols[idx]:
+                st.metric(
+                    label=fname, 
+                    value=f"₹ {f_final:,.0f}", 
+                    delta=f"{f_abs_ret:.2f}%" if f_final > 0 else "-"
+                )
+
+    st.write("---")
+    
+    # Plotly Canvas
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter(
+        x=result_df['Date'],
+        y=result_df['Index_Close'],
+        mode='lines',
+        name=selected_benchmark_name,
+        line=dict(width=2),
+        hovertemplate="<b>" + selected_benchmark_name + "</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
+    ))
+
+    for fname in mf_dfs.keys():
+        fig.add_trace(go.Scatter(
+            x=result_df['Date'],
+            y=result_df[fname],
+            mode='lines',
+            name=fname,
+            hovertemplate="<b>%{fullData.name}</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
+        ))
+
+    fig.update_layout(
+        title=f"Portfolio Growth via {investment_type} (From {start_dt.strftime('%b %d, %Y')} to {end_dt.strftime('%b %d, %Y')})",
+        hovermode="x unified",
+        yaxis=dict(title="Portfolio Value (₹)", tickformat=","),
+        xaxis=dict(title=""),
+        margin=dict(l=0, r=0, t=50, b=0)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Core Metric Tables
+    format_dict = {
+        "Total Invested (₹)": "₹ {:,.0f}",
+        "Final Value (₹)": "₹ {:,.0f}",
+        "Absolute Return (%)": "{:.2f}%", 
+        "Annualized Return (%)": "{:.2f}%", 
+        "Outperformance (%)": lambda x: f"{x:.2f}%" if pd.notna(x) else "-"
+    }
+    
+    bm_df = pd.DataFrame(bm_metrics_data)
+    fund_df = pd.DataFrame(fund_metrics_data)
+    
+    st.subheader("Benchmark Index")
+    st.dataframe(bm_df.style.format(format_dict), use_container_width=True, hide_index=True)
+    
+    st.subheader("Mutual Funds")
+    if not fund_df.empty:
+        styled_fund_df = fund_df.style.format(format_dict).map(
+            color_formatting, subset=["Absolute Return (%)", "Annualized Return (%)", "Outperformance (%)"]
+        )
+        st.dataframe(styled_fund_df, use_container_width=True, hide_index=True)
+
+    export_df = pd.concat([bm_df, fund_df], ignore_index=True)
+    csv_data = export_df.to_csv(index=False)
+    st.download_button(
+        label="Download Analysis Report (CSV)", 
+        data=csv_data, 
+        file_name='MF_Analysis.csv', 
+        mime='text/csv'
+    )
+
+
+# --- TAB 2: RISK & CONSISTENCY ---
+with tab_risk:
+    st.subheader("Risk & Consistency Analytics")
+    st.markdown("""
+    **Metrics Overview:**
+    - **Best/Worst Year:** The highest and lowest return generated in a single 1-year period. 
+    - **Loss-Making Years:** How often the fund ended a calendar year in the negative. 
+    - **Years to Double:** Using historical growth, the approximate time to double your money.
+    """)
+    
+    bm_risk_data = []
+    fund_risk_data = []
+    
+    for asset in assets:
+        is_index = (asset == 'Index_Close')
+        asset_label = selected_benchmark_name if is_index else asset
+        
+        asset_prices = sim_df[asset].dropna()
+        if asset_prices.empty:
+            continue
+            
+        total_days = len(asset_prices)
+        if total_days > 252:
+            rolling_1y = asset_prices.pct_change(periods=252).dropna() * 100
+            best_1y = rolling_1y.max()
+            worst_1y = rolling_1y.min()
+        else:
+            best_1y = np.nan
+            worst_1y = np.nan
+            
+        prices_with_dates = sim_df.set_index('Date')[asset].dropna()
+        yearly_prices = prices_with_dates.resample('YE').last()
+        yearly_returns = yearly_prices.pct_change() * 100
+        loss_making_years = (yearly_returns < 0).sum()
+        
+        end_val, invest_val, asset_years = get_true_metrics(asset)
+        asset_cagr = calc_return(invest_val, end_val, asset_years)
+        years_to_double = (72 / asset_cagr) if asset_cagr > 0 else np.nan
+        
+        risk_row = {
+            "Asset Name": asset_label,
+            "Best 1-Year Return (%)": best_1y,
+            "Worst 1-Year Return (%)": worst_1y,
+            "Loss-Making Years": loss_making_years,
+            "Years to Double": years_to_double
+        }
+        
+        if is_index:
+            bm_risk_data.append(risk_row)
+        else:
+            fund_risk_data.append(risk_row)
+
+    risk_format_dict = {
+        "Best 1-Year Return (%)": "{:.2f}%",
+        "Worst 1-Year Return (%)": "{:.2f}%",
+        "Years to Double": "{:.1f} yrs"
+    }
+
+    st.subheader("Benchmark Index")
+    st.dataframe(pd.DataFrame(bm_risk_data).style.format(risk_format_dict, na_rep="-"), use_container_width=True, hide_index=True)
+    
+    st.subheader("Mutual Funds")
+    if fund_risk_data:
+        fund_risk_df = pd.DataFrame(fund_risk_data)
+        st.dataframe(
+            fund_risk_df.style.format(risk_format_dict, na_rep="-").map(color_formatting, subset=["Best 1-Year Return (%)", "Worst 1-Year Return (%)"]), 
+            use_container_width=True, 
+            hide_index=True
+        )
+
+
+# --- TAB 3: MARKET NEWS ---
+with tab_news:
+    st.subheader("Market News")
+    st.write("Disclaimer: News results are pulled dynamically and may vary based on market availability.")
+    
+    for fname in mf_dfs.keys():
+        st.markdown(f"#### {fname}")
+        try:
+            results = DDGS().text(f"{fname} mutual fund market news", max_results=3)
+            if hasattr(results, '__iter__'):
+                hits = list(results)
+                if len(hits) > 0:
+                    for r in hits[:3]:
+                        with st.expander(r.get('title', 'News Article')):
+                            st.write(r.get('body', ''))
+                            st.markdown(f"[Read Article]({r.get('href', '')})")
+                else:
+                    st.write("No recent news found.")
+            else:
+                st.write("Unexpected DuckDuckGo API response format.")
+        except Exception:
+            st.error(f"Could not fetch news for {fname}. (Rate limited or network error)")
+

@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,6 +7,42 @@ import requests
 import datetime
 import yfinance as yf
 from duckduckgo_search import DDGS
+
+
+def _fmt_inr(value) -> str:
+    """Format a number with Indian comma grouping (e.g. 12,34,567 = 12.34 Lakhs)."""
+    try:
+        v = int(round(float(value)))
+    except (TypeError, ValueError):
+        return str(value)
+    negative = v < 0
+    v = abs(v)
+    s = str(v)
+    if len(s) <= 3:
+        grouped = s
+    else:
+        grouped = s[-3:]
+        s = s[:-3]
+        while s:
+            grouped = s[-2:] + ',' + grouped
+            s = s[:-2]
+    return f"₹ {'-' if negative else ''}{grouped}"
+
+
+# Strip common AMFI boilerplate so legend labels are concise
+_LEGEND_STRIP = re.compile(
+    r'\(FORMERLY KNOWN AS[^)]*\)'
+    r'|- DIRECT PLAN.*'
+    r'|- REGULAR PLAN.*'
+    r'|INCOME DISTRIBUTION CUM CAPITAL WITHDRAWAL OPTION.*'
+    r'|\(REINVESTMENT\)|\(PAYOUT[^)]*\)',
+    re.IGNORECASE
+)
+
+def _short_name(name: str, max_len: int = 35) -> str:
+    """Return a short legend label: strip boilerplate then truncate."""
+    cleaned = re.sub(r'\s+', ' ', _LEGEND_STRIP.sub('', name)).strip(' -')
+    return cleaned if len(cleaned) <= max_len else cleaned[:max_len].rstrip() + "…"
 
 st.set_page_config(page_title="MF Growth Analyser", layout="wide")
 
@@ -115,7 +152,30 @@ if not all_funds:
     st.error("Failed to load active funds database.")
     st.stop()
 
-selected_fund_names = st.multiselect("Select Mutual Funds", options=list(all_funds.keys()), default=[list(all_funds.keys())[0]] if all_funds else [])
+# Fund search — separate text input so the search term persists across fund selections
+fund_search = st.text_input(
+    "Search Funds",
+    placeholder="Type AMC name, category, keyword…",
+    key="fund_search_input"
+)
+if fund_search:
+    filtered_options = [n for n in all_funds.keys() if fund_search.upper() in n]
+else:
+    filtered_options = list(all_funds.keys())
+
+# Always keep any already-selected funds in the options list so they are never
+# silently dropped when the search filter changes (Streamlit drops values that
+# are not present in `options` on rerun).
+_current_selection = st.session_state.get("fund_multiselect", [])
+_merged_options = list(dict.fromkeys(_current_selection + filtered_options))
+
+selected_fund_names = st.multiselect(
+    "Select Mutual Funds (max 5)",
+    options=_merged_options,
+    max_selections=5,
+    placeholder="Select up to 5 funds from the filtered list…",
+    key="fund_multiselect"
+)
 
 if not selected_fund_names:
     st.info("Please select at least one mutual fund.")
@@ -156,37 +216,7 @@ with st.spinner("Fetching live portfolio data..."):
     max_date = merged_df["Date"].max().date()
 
 
-# --- Isolated Target Wealth Planner Logic ---
-planner_data = []
-n_months = horizon_yrs * 12
-
-for asset_name in list(mf_dfs.keys()) + ["Index_Close"]:
-    prices_df = merged_df[['Date', asset_name]].dropna()
-    if len(prices_df) > 2:
-        start_val = prices_df[asset_name].iloc[0]
-        end_val = prices_df[asset_name].iloc[-1]
-        yrs = (prices_df['Date'].iloc[-1] - prices_df['Date'].iloc[0]).days / 365.25
-        
-        c_ret = 0.0
-        if yrs > 0 and start_val > 0:
-            c_ret = ((end_val / start_val) ** (1/yrs) - 1) * 100
-            
-        r_month = ((1 + c_ret/100.0) ** (1/12.0)) - 1
-        if r_month > 0:
-            pmt = (goal_amt * r_month) / (((1 + r_month)**n_months - 1) * (1 + r_month))
-        else:
-            pmt = goal_amt / n_months
-            
-        display_name = selected_benchmark_name if asset_name == "Index_Close" else asset_name
-        planner_data.append({
-            "Asset/Benchmark Name": display_name, 
-            "Historical Max CAGR": f"{c_ret:.2f}%", 
-            "Required Monthly SIP": f"₹ {pmt:,.0f}"
-        })
-
-with planner_results_placeholder.container():
-    st.write("Required investments linked to absolute maximum historical growth bounds:")
-    st.dataframe(pd.DataFrame(planner_data), use_container_width=True, hide_index=True)
+# Planner calculation is deferred below — after filtered_df is built from the selected timeframe
 
 
 st.write("---")
@@ -242,6 +272,40 @@ if filtered_df.empty:
     
 # Render cleanly filled subsets structurally strictly for mathematical plotting boundaries
 sim_df = filtered_df.ffill().bfill()
+
+
+# --- Target Wealth Planner (uses selected timeframe CAGR, not all-time max) ---
+planner_data = []
+n_months = horizon_yrs * 12
+period_label = time_choice if time_choice != 'Custom' else "Custom Range"
+
+for asset_name in list(mf_dfs.keys()) + ["Index_Close"]:
+    prices_df = filtered_df[['Date', asset_name]].dropna()
+    if len(prices_df) > 2:
+        start_val = prices_df[asset_name].iloc[0]
+        end_val = prices_df[asset_name].iloc[-1]
+        yrs = (prices_df['Date'].iloc[-1] - prices_df['Date'].iloc[0]).days / 365.25
+
+        c_ret = 0.0
+        if yrs > 0 and start_val > 0:
+            c_ret = ((end_val / start_val) ** (1 / yrs) - 1) * 100
+
+        r_month = ((1 + c_ret / 100.0) ** (1 / 12.0)) - 1
+        if r_month > 0:
+            pmt = (goal_amt * r_month) / (((1 + r_month) ** n_months - 1) * (1 + r_month))
+        else:
+            pmt = goal_amt / n_months
+
+        display_name = selected_benchmark_name if asset_name == "Index_Close" else asset_name
+        planner_data.append({
+            "Asset / Benchmark": display_name,
+            f"CAGR ({period_label})": f"{c_ret:.2f}%",
+            "Required Monthly SIP": _fmt_inr(pmt),
+        })
+
+with planner_results_placeholder.container():
+    st.caption(f"SIP required to reach your goal, calculated using **{period_label}** period returns. Change the timeframe above to update.")
+    st.dataframe(pd.DataFrame(planner_data), use_container_width=True, hide_index=True)
 
 
 # --- Core Math Simulation ---
@@ -388,7 +452,7 @@ with tab_perf:
     with cols[0]:
         st.metric(
             label=f"{selected_benchmark_name} (Benchmark)", 
-            value=f"₹ {benchmark_final:,.0f}", 
+            value=_fmt_inr(benchmark_final), 
             delta=f"{benchmark_abs_ret:.2f}%"
         )
         
@@ -400,7 +464,7 @@ with tab_perf:
             with cols[idx]:
                 st.metric(
                     label=fname, 
-                    value=f"₹ {f_final:,.0f}", 
+                    value=_fmt_inr(f_final) if f_final > 0 else "-", 
                     delta=f"{f_abs_ret:.2f}%" if f_final > 0 else "-"
                 )
 
@@ -419,12 +483,14 @@ with tab_perf:
     ))
 
     for fname in mf_dfs.keys():
+        n_rows = len(result_df)
         fig.add_trace(go.Scatter(
             x=result_df['Date'],
             y=result_df[fname],
             mode='lines',
-            name=fname,
-            hovertemplate="<b>%{fullData.name}</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
+            name=_short_name(fname),          # short label in legend
+            customdata=[fname] * n_rows,       # full name stored per point
+            hovertemplate="<b>%{customdata}</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
         ))
 
     fig.update_layout(
@@ -438,8 +504,8 @@ with tab_perf:
 
     # Core Metric Tables
     format_dict = {
-        "Total Invested (₹)": "₹ {:,.0f}",
-        "Final Value (₹)": "₹ {:,.0f}",
+        "Total Invested (₹)": _fmt_inr,
+        "Final Value (₹)": _fmt_inr,
         "Absolute Return (%)": "{:.2f}%", 
         "Annualized Return (%)": "{:.2f}%", 
         "Outperformance (%)": lambda x: f"{x:.2f}%" if pd.notna(x) else "-"
@@ -540,25 +606,105 @@ with tab_risk:
 
 
 # --- TAB 3: MARKET NEWS ---
+
+# Maps keywords found in fund names → (Google News search query, human-readable theme label)
+# Ordered by specificity (more specific patterns first)
+_THEME_MAP = [
+    (['NIFTY 50',  'NIFTY50',  'NIFTY NEXT 50'],        'Nifty 50 NSE index India stocks',              'Nifty 50 / Large Cap Index'),
+    (['NIFTY MIDCAP', 'MIDCAP', 'MID CAP'],             'NSE midcap India equity stocks market',         'Mid Cap Equity'),
+    (['SMALL CAP', 'SMALLCAP'],                          'NSE smallcap India equity stocks market',       'Small Cap Equity'),
+    (['SENSEX', 'BSE 500', 'BSE 200'],                   'BSE Sensex India stocks market',                'BSE Index'),
+    (['BANKING & PSU', 'BANKING AND PSU', 'PSU DEBT'],   'Indian banking PSU bonds RBI debt market',      'Banking & PSU Debt'),
+    (['BANKING', 'BANK', 'FINANCIAL SERVICES'],          'Indian banking sector stocks NSE BSE',          'Banking & Financial Services'),
+    (['CORPORATE BOND', 'CREDIT RISK'],                  'India corporate bonds credit market yield',     'Corporate Bonds'),
+    (['OVERNIGHT', 'LIQUID'],                            'RBI repo rate India money market overnight',    'Money Market / Overnight'),
+    (['GILT', 'GSEC', 'G-SEC', 'GOVERNMENT SECURITIES'], 'RBI India government securities gilt bonds',   'Government Securities / Gilt'),
+    (['IT', 'TECHNOLOGY', 'TECH'],                       'India IT technology sector stocks Infosys TCS', 'Technology Sector'),
+    (['PHARMA', 'HEALTHCARE', 'HEALTH CARE'],             'India pharma healthcare stocks market NSE',     'Pharma & Healthcare'),
+    (['INFRASTRUCTURE', 'INFRA'],                        'India infrastructure sector stocks market',     'Infrastructure'),
+    (['INTERNATIONAL', 'GLOBAL', 'US', 'NASDAQ'],        'global equity markets international index',     'International / Global'),
+    (['FLEXI CAP', 'FLEXICAP', 'MULTI CAP', 'MULTICAP'], 'Indian equity market diversified stocks NSE',   'Flexi / Multi Cap'),
+    (['ETF'],                                            'India ETF NSE index market',                   'ETF'),
+]
+
+def _get_fund_theme(fund_name: str):
+    """Return (search_query, theme_label) for a fund based on keywords in its name."""
+    name = fund_name.upper()
+    for keywords, query, label in _THEME_MAP:
+        if any(kw in name for kw in keywords):
+            return query, label
+    return 'Indian stock market mutual funds NSE BSE', 'General Equity'
+
+# --- NewsAPI config ---
+_NEWSAPI_KEY = "918c748329664746ab1b86af41376a6f"
+# Trusted Indian & global financial outlets — filtered server-side by NewsAPI
+_NEWSAPI_DOMAINS = (
+    "economictimes.indiatimes.com,livemint.com,business-standard.com,"
+    "moneycontrol.com,thehindu.com,reuters.com,businesstoday.in,"
+    "financialexpress.com,ndtvprofit.com,thehindubusinessline.com"
+)
+
+@st.cache_data(ttl=3600)
+def _fetch_newsapi(query: str, max_results: int = 5):
+    """Fetch structured news from NewsAPI — filtered to trusted sources, cached 1 hour."""
+    params = {
+        "q":        query,
+        "language": "en",
+        "sortBy":   "publishedAt",
+        "pageSize": max_results,
+        "domains":  _NEWSAPI_DOMAINS,
+        "apiKey":   _NEWSAPI_KEY,
+    }
+    resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    articles = []
+    for art in data.get("articles", []):
+        articles.append({
+            "title":  art.get("title", "Article"),
+            "url":    art.get("url", ""),
+            "body":   art.get("description") or "",
+            "source": art.get("source", {}).get("name", ""),
+            "date":   art.get("publishedAt", "")[:10],
+        })
+    return articles
+
+
 with tab_news:
     st.subheader("Market News")
-    st.write("Disclaimer: News results are pulled dynamically and may vary based on market availability.")
-    
+    st.caption("News grouped by each fund's investment theme, sourced from NewsAPI. Refreshes hourly.")
+
+    # Group selected funds by theme — avoid duplicate queries for same theme
+    from collections import defaultdict
+    theme_groups  = defaultdict(list)   # label → [fund names]
+    theme_queries = {}                  # label → search query
+
     for fname in mf_dfs.keys():
-        st.markdown(f"#### {fname}")
+        query, label = _get_fund_theme(fname)
+        theme_groups[label].append(fname)
+        theme_queries[label] = query
+
+    for label, fund_names in theme_groups.items():
+        query = theme_queries[label]
+        st.markdown(f"### {label}")
+        st.caption("Funds in this theme: " + "  ·  ".join(f"`{n}`" for n in fund_names))
+
         try:
-            results = DDGS().text(f"{fname} mutual fund market news", max_results=3)
-            if hasattr(results, '__iter__'):
-                hits = list(results)
-                if len(hits) > 0:
-                    for r in hits[:3]:
-                        with st.expander(r.get('title', 'News Article')):
-                            st.write(r.get('body', ''))
-                            st.markdown(f"[Read Article]({r.get('href', '')})")
-                else:
-                    st.write("No recent news found.")
+            articles = _fetch_newsapi(query)
+            if articles:
+                for art in articles:
+                    with st.expander(art['title']):
+                        meta = "  ·  ".join(filter(None, [art['source'], art['date']]))
+                        if meta:
+                            st.caption(meta)
+                        if art['body']:
+                            st.write(art['body'])
+                        if art['url']:
+                            st.markdown(f"[Read Full Article]({art['url']})")
             else:
-                st.write("Unexpected DuckDuckGo API response format.")
-        except Exception:
-            st.error(f"Could not fetch news for {fname}. (Rate limited or network error)")
+                st.info("No recent articles found for this theme.")
+        except Exception as e:
+            st.warning(f"Could not load news for '{label}' ({e.__class__.__name__}). Check your connection.")
+
+        st.write("---")
 

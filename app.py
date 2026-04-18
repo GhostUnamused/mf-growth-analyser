@@ -29,20 +29,26 @@ def _fmt_inr(value) -> str:
     return f"₹ {'-' if negative else ''}{grouped}"
 
 
-# Strip common AMFI boilerplate so legend labels are concise
-_LEGEND_STRIP = re.compile(
-    r'\(FORMERLY KNOWN AS[^)]*\)'
-    r'|- DIRECT PLAN.*'
-    r'|- REGULAR PLAN.*'
-    r'|INCOME DISTRIBUTION CUM CAPITAL WITHDRAWAL OPTION.*'
-    r'|\(REINVESTMENT\)|\(PAYOUT[^)]*\)',
-    re.IGNORECASE
-)
-
 def _short_name(name: str, max_len: int = 35) -> str:
-    """Return a short legend label: strip boilerplate then truncate."""
-    cleaned = re.sub(r'\s+', ' ', _LEGEND_STRIP.sub('', name)).strip(' -')
-    return cleaned if len(cleaned) <= max_len else cleaned[:max_len].rstrip() + "…"
+    """Return a concise legend label, preserving plan type (D/R) for disambiguation."""
+    q = name.upper()
+    # Remove truly useless parenthetical (old brand name)
+    q = re.sub(r'\(FORMERLY KNOWN AS[^)]*\)', '', q)
+    # Remove verbose IDCW / payout description
+    q = re.sub(r'INCOME DISTRIBUTION CUM CAPITAL WITHDRAWAL OPTION.*', '', q)
+    q = re.sub(r'\(PAYOUT\s*&?\s*REINVESTMENT\)', '', q, flags=re.IGNORECASE)
+    q = re.sub(r'\b(REINVESTMENT|PAYOUT)\b', '', q)
+    # Compact plan type — keep as short suffix so Direct vs Regular stays visible
+    q = re.sub(r'-?\s*DIRECT PLAN\b', ' (D)', q)
+    q = re.sub(r'-?\s*REGULAR PLAN\b', ' (R)', q)
+    # Strip frequency and redundant option keywords
+    q = re.sub(
+        r'-?\s*\b(FORTNIGHTLY|MONTHLY|QUARTERLY|ANNUAL|DAILY|WEEKLY|'
+        r'GROWTH OPTION|GROWTH|IDCW|BONUS|OPTION)\b', '', q
+    )
+    q = re.sub(r'[\s-]+$', '', q.strip())
+    q = re.sub(r'\s+', ' ', q).strip(' -')
+    return q if len(q) <= max_len else q[:max_len].rstrip() + '…'
 
 st.set_page_config(page_title="MF Growth Analyser", layout="wide")
 
@@ -221,7 +227,7 @@ with st.spinner("Fetching live portfolio data..."):
 
 st.write("---")
 # --- Hybrid Time UI ---
-time_choice = st.radio("Timeframe", ['1M', '6M', 'YTD', '1Y', '3Y', '5Y', '10Y', 'Max', 'Custom'], horizontal=True, index=7)
+time_choice = st.radio("Timeframe", ['1M', '6M', 'YTD', '1Y', '3Y', '5Y', '10Y', 'Max', 'Custom'], horizontal=True, index=4)
 
 max_dt_ts = pd.to_datetime(max_date)
 
@@ -368,6 +374,30 @@ if apply_taxes_inflation:
         result_df[asset] = real_value
 
 
+# --- Plotly color palette (mirrors Plotly's default sequence) ---
+_PLOTLY_PALETTE = [
+    '#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
+    '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52'
+]
+
+# Build unique legend names: deduplicate after boilerplate stripping
+from collections import Counter as _Counter
+_raw_shorts = {f: _short_name(f) for f in mf_dfs.keys()}
+_dup_counts = _Counter(_raw_shorts.values())
+_dup_idx: dict = {}
+LEGEND_NAMES: dict = {}
+for _f, _s in _raw_shorts.items():
+    if _dup_counts[_s] > 1:
+        _dup_idx[_s] = _dup_idx.get(_s, 0) + 1
+        LEGEND_NAMES[_f] = f"{_s} ({_dup_idx[_s]})"
+    else:
+        LEGEND_NAMES[_f] = _s
+
+# Assign explicit colors per asset so chart ↔ table match perfectly
+ASSET_COLORS: dict = {selected_benchmark_name: _PLOTLY_PALETTE[0]}
+for _i, _f in enumerate(mf_dfs.keys(), start=1):
+    ASSET_COLORS[_f] = _PLOTLY_PALETTE[_i % len(_PLOTLY_PALETTE)]
+
 # --- Universal Callbacks and Data Prep ---
 tab_perf, tab_risk, tab_news = st.tabs(["Performance", "Risk & Consistency", "Market News"])
 
@@ -478,7 +508,7 @@ with tab_perf:
         y=result_df['Index_Close'],
         mode='lines',
         name=selected_benchmark_name,
-        line=dict(width=2),
+        line=dict(width=2, color=ASSET_COLORS[selected_benchmark_name]),
         hovertemplate="<b>" + selected_benchmark_name + "</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
     ))
 
@@ -488,8 +518,9 @@ with tab_perf:
             x=result_df['Date'],
             y=result_df[fname],
             mode='lines',
-            name=_short_name(fname),          # short label in legend
-            customdata=[fname] * n_rows,       # full name stored per point
+            name=LEGEND_NAMES[fname],
+            line=dict(color=ASSET_COLORS[fname]),
+            customdata=[fname] * n_rows,
             hovertemplate="<b>%{customdata}</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
         ))
 
@@ -511,16 +542,31 @@ with tab_perf:
         "Outperformance (%)": lambda x: f"{x:.2f}%" if pd.notna(x) else "-"
     }
     
+    def _style_asset_col(series):
+        """Color each Asset Name cell to match its chart trace colour."""
+        return [
+            f'color: {ASSET_COLORS.get(v, "inherit")}; font-weight: 600'
+            for v in series
+        ]
+
     bm_df = pd.DataFrame(bm_metrics_data)
     fund_df = pd.DataFrame(fund_metrics_data)
-    
+
     st.subheader("Benchmark Index")
-    st.dataframe(bm_df.style.format(format_dict), use_container_width=True, hide_index=True)
-    
+    st.dataframe(
+        bm_df.style
+            .format(format_dict)
+            .apply(_style_asset_col, subset=["Asset Name"]),
+        use_container_width=True, hide_index=True
+    )
+
     st.subheader("Mutual Funds")
     if not fund_df.empty:
-        styled_fund_df = fund_df.style.format(format_dict).map(
-            color_formatting, subset=["Absolute Return (%)", "Annualized Return (%)", "Outperformance (%)"]
+        styled_fund_df = (
+            fund_df.style
+                .format(format_dict)
+                .apply(_style_asset_col, subset=["Asset Name"])
+                .map(color_formatting, subset=["Absolute Return (%)", "Annualized Return (%)", "Outperformance (%)"])
         )
         st.dataframe(styled_fund_df, use_container_width=True, hide_index=True)
 
@@ -539,48 +585,64 @@ with tab_risk:
     st.subheader("Risk & Consistency Analytics")
     st.markdown("""
     **Metrics Overview:**
-    - **Best/Worst Year:** The highest and lowest return generated in a single 1-year period. 
-    - **Loss-Making Years:** How often the fund ended a calendar year in the negative. 
-    - **Years to Double:** Using historical growth, the approximate time to double your money.
+    - **Best / Worst 1-Year Return:** Highest and lowest return across any rolling 12-month window in the selected period.
+    - **Max Drawdown:** Largest peak-to-trough NAV decline — the worst loss you could have suffered buying at a local high.
+    - **Annualised Volatility:** Standard deviation of daily returns scaled to a year. Lower = smoother ride.
+    - **Loss-Making Years:** Count of calendar years the fund closed in the red.
+    - **Years to Double:** Rule-of-72 estimate using the selected-period CAGR.
     """)
-    
+
     bm_risk_data = []
     fund_risk_data = []
-    
+
     for asset in assets:
         is_index = (asset == 'Index_Close')
         asset_label = selected_benchmark_name if is_index else asset
-        
+
         asset_prices = sim_df[asset].dropna()
         if asset_prices.empty:
             continue
-            
+
         total_days = len(asset_prices)
+
+        # Rolling 1-year best / worst
         if total_days > 252:
             rolling_1y = asset_prices.pct_change(periods=252).dropna() * 100
-            best_1y = rolling_1y.max()
+            best_1y  = rolling_1y.max()
             worst_1y = rolling_1y.min()
         else:
-            best_1y = np.nan
-            worst_1y = np.nan
-            
+            best_1y = worst_1y = np.nan
+
+        # Max drawdown: largest peak-to-trough percentage decline
+        cummax       = asset_prices.expanding().max()
+        drawdown_pct = (asset_prices - cummax) / cummax * 100
+        max_drawdown = drawdown_pct.min()
+
+        # Annualised volatility (std of daily returns × √252)
+        daily_rets = asset_prices.pct_change().dropna()
+        ann_vol    = daily_rets.std() * np.sqrt(252) * 100 if len(daily_rets) > 1 else np.nan
+
+        # Calendar-year loss count
         prices_with_dates = sim_df.set_index('Date')[asset].dropna()
-        yearly_prices = prices_with_dates.resample('YE').last()
-        yearly_returns = yearly_prices.pct_change() * 100
-        loss_making_years = (yearly_returns < 0).sum()
-        
+        yearly_prices     = prices_with_dates.resample('YE').last()
+        yearly_returns    = yearly_prices.pct_change() * 100
+        loss_making_years = int((yearly_returns < 0).sum())
+
+        # Years to double via Rule of 72 (uses selected-period CAGR)
         end_val, invest_val, asset_years = get_true_metrics(asset)
-        asset_cagr = calc_return(invest_val, end_val, asset_years)
+        asset_cagr     = calc_return(invest_val, end_val, asset_years)
         years_to_double = (72 / asset_cagr) if asset_cagr > 0 else np.nan
-        
+
         risk_row = {
-            "Asset Name": asset_label,
+            "Asset Name":                asset_label,
             "Best 1-Year Return (%)": best_1y,
             "Worst 1-Year Return (%)": worst_1y,
-            "Loss-Making Years": loss_making_years,
-            "Years to Double": years_to_double
+            "Max Drawdown (%)": max_drawdown,
+            "Annualised Volatility (%)": ann_vol,
+            "Loss-Making Years":         loss_making_years,
+            "Years to Double":           years_to_double,
         }
-        
+
         if is_index:
             bm_risk_data.append(risk_row)
         else:
@@ -589,18 +651,29 @@ with tab_risk:
     risk_format_dict = {
         "Best 1-Year Return (%)": "{:.2f}%",
         "Worst 1-Year Return (%)": "{:.2f}%",
-        "Years to Double": "{:.1f} yrs"
+        "Max Drawdown (%)": "{:.2f}%",
+        "Annualised Volatility (%)": "{:.2f}%",
+        "Years to Double": "{:.1f} yrs",
     }
+    _risk_color_cols = ["Best 1-Year Return (%)", "Worst 1-Year Return (%)", "Max Drawdown (%)"]
 
     st.subheader("Benchmark Index")
-    st.dataframe(pd.DataFrame(bm_risk_data).style.format(risk_format_dict, na_rep="-"), use_container_width=True, hide_index=True)
-    
+    st.dataframe(
+        pd.DataFrame(bm_risk_data).style
+            .format(risk_format_dict, na_rep="-")
+            .apply(_style_asset_col, subset=["Asset Name"]),
+        use_container_width=True, hide_index=True
+    )
+
     st.subheader("Mutual Funds")
     if fund_risk_data:
         fund_risk_df = pd.DataFrame(fund_risk_data)
         st.dataframe(
-            fund_risk_df.style.format(risk_format_dict, na_rep="-").map(color_formatting, subset=["Best 1-Year Return (%)", "Worst 1-Year Return (%)"]), 
-            use_container_width=True, 
+            fund_risk_df.style
+                .format(risk_format_dict, na_rep="-")
+                .apply(_style_asset_col, subset=["Asset Name"])
+                .map(color_formatting, subset=_risk_color_cols),
+            use_container_width=True,
             hide_index=True
         )
 

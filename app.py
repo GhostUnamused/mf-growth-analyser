@@ -58,6 +58,7 @@ planner_expander = st.expander("Target Wealth Planner (Reverse SIP)")
 with planner_expander:
     col_g, col_h = st.columns(2)
     goal_amt = col_g.number_input("Financial Goal (₹)", min_value=10000, value=10000000, step=100000)
+    col_g.caption(f"→ {_fmt_inr(goal_amt)}")
     horizon_yrs = col_h.number_input("Time Horizon (Years)", min_value=1, value=10, step=1)
     planner_results_placeholder = st.empty()
 
@@ -66,7 +67,7 @@ BENCHMARKS = {
     "Nifty 50": "^NSEI", 
     "BSE Sensex": "^BSESN", 
     "Nifty 500": "^CRSLDX", 
-    "Nifty Midcap 100": "^NSEMDCP50"
+    "Nifty Midcap 100": "NIFTY_MIDCAP_100.NS"
 }
 EXCLUDE_WORDS = ['CLOSED', 'MATURED', 'SUSPENDED', 'IDCW', 'DIVIDEND']
 
@@ -137,6 +138,7 @@ with col2:
 with col3:
     label = "Monthly SIP Amount (₹)" if investment_type == "SIP" else "Initial Lumpsum (₹)"
     amount = st.number_input(label, min_value=500, value=10000, step=500)
+    st.caption(f"→ {_fmt_inr(amount)}")
 
 with col4:
     if investment_type == "SIP":

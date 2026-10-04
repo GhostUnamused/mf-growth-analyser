@@ -1,15 +1,16 @@
 [theme]
-base = "light"
-primaryColor = "#1f4e8c"
-backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#f5f5f2"
-textColor = "#1b1b1a"
+base = "dark"
+primaryColor = "#c9b48a"
+backgroundColor = "#0d0d0d"
+secondaryBackgroundColor = "#161616"
+textColor = "#e8e5df"
 font = "sans serif"
 baseRadius = "small"
-borderColor = "#e3e2dd"
+borderColor = "#262626"
 
 [client]
-toolbarMode = "minimal"
+toolbarMode = "viewer"
+showErrorDetails = false
 
 [browser]
 gatherUsageStats = false

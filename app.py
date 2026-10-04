@@ -41,16 +41,17 @@ MAX_FUNDS = 5
 
 # Categorical series colours, assigned in fixed order (never cycled). The
 # benchmark is drawn in neutral grey so the funds carry the colour.
-FUND_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#4a3aa7", "#e34948"]
-BENCHMARK_COLOR = "#7a7974"
-POS_COLOR = "#1a7f37"
-NEG_COLOR = "#c62828"
-GRID_COLOR = "rgba(0,0,0,0.07)"
+FUND_COLORS = ["#b98629", "#1f9e7f", "#d4583a", "#8a6fd6", "#cc4f7f"]
+BENCHMARK_COLOR = "#9a978f"
+POS_COLOR = "#5cb88a"
+NEG_COLOR = "#e0736a"
+GRID_COLOR = "rgba(255,255,255,0.06)"
 CHART_LAYOUT = dict(
-    template="plotly_white",
-    font=dict(family="Source Sans Pro, sans-serif", size=12, color="#3d3c39"),
+    template="plotly_dark",
+    font=dict(family="Source Sans Pro, sans-serif", size=12, color="#a8a59e"),
     hovermode="x unified",
-    hoverlabel=dict(bgcolor="white", bordercolor="#e3e2dd", font_size=12),
+    hoverlabel=dict(bgcolor="#1b1b1b", bordercolor="#333333", font_size=12,
+                    font_color="#e8e5df"),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title_text=""),
     margin=dict(l=8, r=8, t=10, b=8),
     plot_bgcolor="rgba(0,0,0,0)",
@@ -461,18 +462,27 @@ st.set_page_config(page_title="MF Growth Analyser", layout="wide")
 st.markdown(
     """
     <style>
-      .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1320px; }
-      h1 { font-weight: 650; letter-spacing: -0.02em; margin-bottom: 0 !important; }
-      h3 { font-weight: 600; letter-spacing: -0.01em; }
-      [data-testid="stMetricLabel"] p { font-size: 0.82rem; color: #5f5e5a; }
-      [data-testid="stMetricValue"] { font-size: 1.55rem; font-variant-numeric: tabular-nums; }
-      .mfga-sub { color: #5f5e5a; font-size: 0.95rem; margin: 0.15rem 0 1.2rem; }
+      /* Hide Streamlit chrome: header toolbar (Fork / GitHub / menu), footer. */
+      header[data-testid="stHeader"], [data-testid="stToolbar"], [data-testid="stDecoration"],
+      .stAppDeployButton, #MainMenu, footer { display: none !important; }
+
+      .block-container { padding-top: 2.4rem; padding-bottom: 3rem; max-width: 1320px; }
+      h1 { font-weight: 600; letter-spacing: -0.025em; margin-bottom: 0 !important; color: #f2efe9; }
+      h3, h5 { font-weight: 600; letter-spacing: -0.01em; color: #ece9e3; }
+      [data-testid="stMetric"] { background: #121212; }
+      [data-testid="stMetricLabel"] p { font-size: 0.8rem; color: #8f8c85; letter-spacing: 0.01em; }
+      [data-testid="stMetricValue"] { font-size: 1.55rem; font-variant-numeric: tabular-nums; color: #f2efe9; }
+      [data-testid="stVerticalBlockBorderWrapper"] { background: #111111; }
+      [data-testid="stMultiSelectTagsContainer"] [data-tag] {
+          background-color: #2a2620 !important; border: 1px solid #3d362a; color: #e3d5b8 !important; }
+      [data-testid="stMultiSelectTagsContainer"] [data-tag] * { color: #e3d5b8 !important; }
+      .mfga-sub { color: #8f8c85; font-size: 0.95rem; margin: 0.2rem 0 1.4rem; }
       .mfga-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
                      margin-right: 6px; vertical-align: baseline; }
-      .mfga-news { padding: 0.55rem 0; border-bottom: 1px solid rgba(0,0,0,0.07); }
-      .mfga-news a { color: inherit; text-decoration: none; font-weight: 500; }
-      .mfga-news a:hover { text-decoration: underline; }
-      .mfga-meta { color: #75746f; font-size: 0.8rem; margin-top: 0.1rem; }
+      .mfga-news { padding: 0.6rem 0; border-bottom: 1px solid #222222; }
+      .mfga-news a { color: #e8e5df; text-decoration: none; font-weight: 500; }
+      .mfga-news a:hover { color: #c9b48a; }
+      .mfga-meta { color: #85827b; font-size: 0.8rem; margin-top: 0.15rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -692,7 +702,7 @@ with tab_perf:
     if all(sims[f]["first"] == invested_ref["first"] for f in funds):
         fig.add_trace(go.Scatter(
             x=dates, y=invested_ref["invested"], name="Amount invested", mode="lines",
-            line=dict(color="#b5b4ae", width=1.5, shape="hv"),
+            line=dict(color="#5a5852", width=1.5, shape="hv"),
             hovertemplate="Invested: %{y:,.0f}<extra></extra>",
         ))
     fig.update_layout(
@@ -793,7 +803,7 @@ with tab_risk:
         height=360,
         yaxis=dict(ticksuffix="%", gridcolor=GRID_COLOR, zeroline=True,
                    range=[dd_floor * 1.08 - 1, 2],
-                   zerolinecolor="rgba(0,0,0,0.25)", automargin=True),
+                   zerolinecolor="rgba(255,255,255,0.22)", automargin=True),
         xaxis=dict(showgrid=False, automargin=True),
     )
     st.plotly_chart(dd, width="stretch", theme=None, config={"displaylogo": False})

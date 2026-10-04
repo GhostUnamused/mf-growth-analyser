@@ -1,785 +1,898 @@
+import html
 import re
-import streamlit as st
-import pandas as pd
+import datetime
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict
+from email.utils import parsedate_to_datetime
+
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
 import requests
-import datetime
+import streamlit as st
 import yfinance as yf
-from duckduckgo_search import DDGS
 
 
-def _fmt_inr(value) -> str:
-    """Format a number with Indian comma grouping (e.g. 12,34,567 = 12.34 Lakhs)."""
-    try:
-        v = int(round(float(value)))
-    except (TypeError, ValueError):
-        return str(value)
-    negative = v < 0
-    v = abs(v)
-    s = str(v)
-    if len(s) <= 3:
-        grouped = s
-    else:
-        grouped = s[-3:]
-        s = s[:-3]
-        while s:
-            grouped = s[-2:] + ',' + grouped
-            s = s[:-2]
-    return f"₹ {'-' if negative else ''}{grouped}"
+# =============================================================================
+# Constants
+# =============================================================================
 
-
-def _short_name(name: str, max_len: int = 35) -> str:
-    """Return a concise legend label, preserving plan type (D/R) for disambiguation."""
-    q = name.upper()
-    # Remove truly useless parenthetical (old brand name)
-    q = re.sub(r'\(FORMERLY KNOWN AS[^)]*\)', '', q)
-    # Remove verbose IDCW / payout description
-    q = re.sub(r'INCOME DISTRIBUTION CUM CAPITAL WITHDRAWAL OPTION.*', '', q)
-    q = re.sub(r'\(PAYOUT\s*&?\s*REINVESTMENT\)', '', q, flags=re.IGNORECASE)
-    q = re.sub(r'\b(REINVESTMENT|PAYOUT)\b', '', q)
-    # Compact plan type — keep as short suffix so Direct vs Regular stays visible
-    q = re.sub(r'-?\s*DIRECT PLAN\b', ' (D)', q)
-    q = re.sub(r'-?\s*REGULAR PLAN\b', ' (R)', q)
-    # Strip frequency and redundant option keywords
-    q = re.sub(
-        r'-?\s*\b(FORTNIGHTLY|MONTHLY|QUARTERLY|ANNUAL|DAILY|WEEKLY|'
-        r'GROWTH OPTION|GROWTH|IDCW|BONUS|OPTION)\b', '', q
-    )
-    q = re.sub(r'[\s-]+$', '', q.strip())
-    q = re.sub(r'\s+', ' ', q).strip(' -')
-    return q if len(q) <= max_len else q[:max_len].rstrip() + '…'
-
-st.set_page_config(page_title="MF Growth Analyser", layout="wide")
-
-st.title("MF Growth Analyser")
-
-planner_expander = st.expander("Target Wealth Planner (Reverse SIP)")
-with planner_expander:
-    col_g, col_h = st.columns(2)
-    goal_amt = col_g.number_input("Financial Goal (₹)", min_value=10000, value=10000000, step=100000)
-    col_g.caption(f"→ {_fmt_inr(goal_amt)}")
-    horizon_yrs = col_h.number_input("Time Horizon (Years)", min_value=1, value=10, step=1)
-    planner_results_placeholder = st.empty()
-
-# --- Constants ---
 BENCHMARKS = {
-    "Nifty 50": "^NSEI", 
-    "BSE Sensex": "^BSESN", 
-    "Nifty 500": "^CRSLDX", 
-    "Nifty Midcap 100": "NIFTY_MIDCAP_100.NS"
+    "Nifty 50": "^NSEI",
+    "BSE Sensex": "^BSESN",
+    "Nifty 500": "^CRSLDX",
+    "Nifty Midcap 100": "NIFTY_MIDCAP_100.NS",
 }
-EXCLUDE_WORDS = ['CLOSED', 'MATURED', 'SUSPENDED', 'IDCW', 'DIVIDEND']
+EXCLUDE_WORDS = ["CLOSED", "MATURED", "SUSPENDED", "IDCW", "DIVIDEND"]
+PERIODS = ["1M", "6M", "YTD", "1Y", "3Y", "5Y", "10Y", "Max", "Custom"]
+PERIOD_OFFSETS = {
+    "1M": pd.DateOffset(months=1),
+    "6M": pd.DateOffset(months=6),
+    "1Y": pd.DateOffset(years=1),
+    "3Y": pd.DateOffset(years=3),
+    "5Y": pd.DateOffset(years=5),
+    "10Y": pd.DateOffset(years=10),
+}
+LTCG_EXEMPTION = 125_000
+# Kept upper-case when fund names are title-cased for display.
+ACRONYMS = {"SBI", "ICICI", "UTI", "IDFC", "LIC", "PGIM", "ITI", "ETF", "FOF", "PSU",
+            "ELSS", "IT", "US", "NASDAQ", "BSE", "NSE", "ESG", "MNC", "AMC"}
+MAX_FUNDS = 5
 
-@st.cache_data(ttl=86400)
-def fetch_active_funds():
-    try:
-        res = requests.get('https://www.amfiindia.com/spages/NAVAll.txt', timeout=15)
-        res.raise_for_status()
-        lines = res.text.split('\n')
-        fund_dict = {}
-        for line in lines:
-            parts = line.split(';')
-            if len(parts) >= 6 and parts[0].strip().isdigit():
-                code = parts[0].strip()
-                name = parts[3].strip().upper()
-                if not any(word in name for word in EXCLUDE_WORDS):
-                    fund_dict[name] = code
-        return fund_dict
-    except Exception:
-        return {}
-
-@st.cache_data(ttl=3600)
-def fetch_mf_data(scheme_code):
-    try:
-        res = requests.get(f"https://api.mfapi.in/mf/{scheme_code}")
-        res.raise_for_status()
-        data = res.json()
-        if "data" not in data or not data["data"]:
-            return None
-        df = pd.DataFrame(data["data"])
-        df["Date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
-        df["MF_NAV"] = pd.to_numeric(df["nav"], errors="coerce")
-        df = df.dropna(subset=['MF_NAV']).sort_values("Date").reset_index(drop=True)
-        return df[["Date", "MF_NAV"]]
-    except Exception:
-        return None
-
-@st.cache_data(ttl=3600)
-def fetch_index_data(ticker, start_dt="2000-01-01"):
-    try:
-        df = yf.download(ticker, start=start_dt)
-        if df.empty:
-            return None
-        df = df.reset_index()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        df = df[['Date', 'Close']].copy()
-        
-        if 'Close' in df.columns and isinstance(df['Close'], pd.DataFrame):
-            df['Close'] = df['Close'].iloc[:, 0]
-            
-        df = df.rename(columns={'Close': 'Index_Close'})
-        df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
-        return df.sort_values('Date').reset_index(drop=True)
-    except Exception:
-        return None
-
-# --- Master Controls (No Sidebar) ---
-col1, col2, col3, col4, col5 = st.columns(5)
-
-with col1:
-    selected_benchmark_name = st.selectbox("Select Benchmark Index", options=list(BENCHMARKS.keys()), index=3)
-    benchmark_ticker = BENCHMARKS[selected_benchmark_name]
-
-with col2:
-    investment_type = st.radio("Investment Type", options=["Lumpsum", "SIP"])
-
-with col3:
-    label = "Monthly SIP Amount (₹)" if investment_type == "SIP" else "Initial Lumpsum (₹)"
-    amount = st.number_input(label, min_value=500, value=10000, step=500)
-    st.caption(f"→ {_fmt_inr(amount)}")
-
-with col4:
-    if investment_type == "SIP":
-        step_up_pct = st.slider("Yearly Step-Up (%)", min_value=0, max_value=50, value=0, step=1)
-    else:
-        step_up_pct = 0
-
-with col5:
-    apply_taxes_inflation = st.toggle("Adjust for Taxes & Inflation")
-    if apply_taxes_inflation:
-        sub_col1, sub_col2 = st.columns(2)
-        with sub_col1:
-            tax_rate = st.number_input("LTCG Tax (%)", value=12.5, step=0.5)
-        with sub_col2:
-            inflation_rate = st.number_input("Inflation (%)", value=5.5, step=0.5)
-
-all_funds = fetch_active_funds()
-if not all_funds:
-    st.error("Failed to load active funds database.")
-    st.stop()
-
-# Fund search — separate text input so the search term persists across fund selections
-fund_search = st.text_input(
-    "Search Funds",
-    placeholder="Type AMC name, category, keyword…",
-    key="fund_search_input"
-)
-if fund_search:
-    filtered_options = [n for n in all_funds.keys() if fund_search.upper() in n]
-else:
-    filtered_options = list(all_funds.keys())
-
-# Always keep any already-selected funds in the options list so they are never
-# silently dropped when the search filter changes (Streamlit drops values that
-# are not present in `options` on rerun).
-_current_selection = st.session_state.get("fund_multiselect", [])
-_merged_options = list(dict.fromkeys(_current_selection + filtered_options))
-
-selected_fund_names = st.multiselect(
-    "Select Mutual Funds (max 5)",
-    options=_merged_options,
-    max_selections=5,
-    placeholder="Select up to 5 funds from the filtered list…",
-    key="fund_multiselect"
+# Categorical series colours, assigned in fixed order (never cycled). The
+# benchmark is drawn in neutral grey so the funds carry the colour.
+FUND_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#4a3aa7", "#e34948"]
+BENCHMARK_COLOR = "#7a7974"
+POS_COLOR = "#1a7f37"
+NEG_COLOR = "#c62828"
+GRID_COLOR = "rgba(0,0,0,0.07)"
+CHART_LAYOUT = dict(
+    template="plotly_white",
+    font=dict(family="Source Sans Pro, sans-serif", size=12, color="#3d3c39"),
+    hovermode="x unified",
+    hoverlabel=dict(bgcolor="white", bordercolor="#e3e2dd", font_size=12),
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title_text=""),
+    margin=dict(l=8, r=8, t=10, b=8),
+    plot_bgcolor="rgba(0,0,0,0)",
+    paper_bgcolor="rgba(0,0,0,0)",
 )
 
-if not selected_fund_names:
-    st.info("Please select at least one mutual fund.")
-    st.stop()
-
-
-# --- Data Fetching & Time Sync ---
-with st.spinner("Fetching live portfolio data..."):
-    index_df = fetch_index_data(benchmark_ticker)
-    if index_df is None:
-        st.error("Failed to fetch Index data.")
-        st.stop()
-
-    mf_dfs = {}
-    for fname in selected_fund_names:
-        scode = all_funds[fname]
-        df = fetch_mf_data(scode)
-        if df is not None and not df.empty:
-            df = df.rename(columns={"MF_NAV": fname})
-            mf_dfs[fname] = df
-
-    if not mf_dfs:
-        st.error("Failed to fetch any Mutual Fund data. They may be inactive.")
-        st.stop()
-
-    merged_df = index_df.copy()
-    for fname, df in mf_dfs.items():
-        merged_df = pd.merge(merged_df, df, on="Date", how="outer")
-
-    merged_df = merged_df.sort_values("Date")
-
-    valid_dates_all = merged_df.dropna(subset=['Index_Close'] + list(mf_dfs.keys()), how='all')["Date"]
-    if valid_dates_all.empty:
-        st.warning("No overlapping data found for the selected assets.")
-        st.stop()
-
-    min_date = valid_dates_all.min().date()
-    max_date = merged_df["Date"].max().date()
-
-
-# Planner calculation is deferred below — after filtered_df is built from the selected timeframe
-
-
-st.write("---")
-# --- Hybrid Time UI ---
-time_choice = st.radio("Timeframe", ['1M', '6M', 'YTD', '1Y', '3Y', '5Y', '10Y', 'Max', 'Custom'], horizontal=True, index=4)
-
-max_dt_ts = pd.to_datetime(max_date)
-
-if time_choice == '1M':
-    start_dt = max_dt_ts - pd.DateOffset(months=1)
-elif time_choice == '6M':
-    start_dt = max_dt_ts - pd.DateOffset(months=6)
-elif time_choice == 'YTD':
-    start_dt = pd.to_datetime(datetime.date(max_dt_ts.year, 1, 1))
-elif time_choice == '1Y':
-    start_dt = max_dt_ts - pd.DateOffset(years=1)
-elif time_choice == '3Y':
-    start_dt = max_dt_ts - pd.DateOffset(years=3)
-elif time_choice == '5Y':
-    start_dt = max_dt_ts - pd.DateOffset(years=5)
-elif time_choice == '10Y':
-    start_dt = max_dt_ts - pd.DateOffset(years=10)
-elif time_choice == 'Max':
-    start_dt = pd.to_datetime(min_date)
-else:
-    start_dt = pd.to_datetime(min_date)
-
-start_dt = max(start_dt, pd.to_datetime(min_date))
-end_dt = max_dt_ts
-
-if time_choice == 'Custom':
-    selected_dates = st.slider(
-        "Select Custom Date Range",
-        min_value=min_date,
-        max_value=max_date,
-        value=(start_dt.date(), end_dt.date())
-    )
-    start_dt = pd.to_datetime(selected_dates[0])
-    end_dt = pd.to_datetime(selected_dates[1])
-
-
-# --- Strict Nearest Valid Trading Day ---
-valid_start_dates = merged_df[merged_df["Date"] >= start_dt]["Date"]
-if not valid_start_dates.empty:
-    start_dt = valid_start_dates.iloc[0]
-
-# Preserve unadulterated NaN states locally for precision checks
-filtered_df = merged_df[(merged_df["Date"] >= start_dt) & (merged_df["Date"] <= end_dt)].copy().reset_index(drop=True)
-
-if filtered_df.empty:
-    st.warning("No valid trading days found in the selected date range.")
-    st.stop()
-    
-# Render cleanly filled subsets structurally strictly for mathematical plotting boundaries
-sim_df = filtered_df.ffill().bfill()
-
-
-# --- Target Wealth Planner (uses selected timeframe CAGR, not all-time max) ---
-planner_data = []
-n_months = horizon_yrs * 12
-period_label = time_choice if time_choice != 'Custom' else "Custom Range"
-
-for asset_name in list(mf_dfs.keys()) + ["Index_Close"]:
-    prices_df = filtered_df[['Date', asset_name]].dropna()
-    if len(prices_df) > 2:
-        start_val = prices_df[asset_name].iloc[0]
-        end_val = prices_df[asset_name].iloc[-1]
-        yrs = (prices_df['Date'].iloc[-1] - prices_df['Date'].iloc[0]).days / 365.25
-
-        c_ret = 0.0
-        if yrs > 0 and start_val > 0:
-            c_ret = ((end_val / start_val) ** (1 / yrs) - 1) * 100
-
-        r_month = ((1 + c_ret / 100.0) ** (1 / 12.0)) - 1
-        if r_month > 0:
-            pmt = (goal_amt * r_month) / (((1 + r_month) ** n_months - 1) * (1 + r_month))
-        else:
-            pmt = goal_amt / n_months
-
-        display_name = selected_benchmark_name if asset_name == "Index_Close" else asset_name
-        planner_data.append({
-            "Asset / Benchmark": display_name,
-            f"CAGR ({period_label})": f"{c_ret:.2f}%",
-            "Required Monthly SIP": _fmt_inr(pmt),
-        })
-
-with planner_results_placeholder.container():
-    st.caption(f"SIP required to reach your goal, calculated using **{period_label}** period returns. Change the timeframe above to update.")
-    st.dataframe(pd.DataFrame(planner_data), use_container_width=True, hide_index=True)
-
-
-# --- Core Math Simulation ---
-# Draw plotting indices entirely dynamically 
-result_df = sim_df[['Date']].copy()
-total_invested_df = sim_df[['Date']].copy()
-assets = ['Index_Close'] + list(mf_dfs.keys())
-
-if investment_type == "Lumpsum":
-    for asset in assets:
-        total_invested_df[asset] = amount
-        # Base value relies on actual existing trace boundaries natively
-        valid_history = filtered_df[asset].dropna()
-        base_val = valid_history.iloc[0] if not valid_history.empty else sim_df[asset].iloc[0]
-        
-        if pd.isna(base_val) or base_val == 0:
-            result_df[asset] = None
-        else:
-            result_df[asset] = (sim_df[asset] / base_val) * amount
-
-elif investment_type == "SIP":
-    sim_df['YearMonth'] = sim_df['Date'].dt.to_period('M')
-    buy_dates_idx = sim_df.groupby('YearMonth')['Date'].idxmin()
-    
-    for asset in assets:
-        units_bought = np.zeros(len(sim_df))
-        invested_tracking = np.zeros(len(sim_df))
-        asset_prices = sim_df[asset].values
-        
-        month_count = 0
-        for i, b_idx in enumerate(buy_dates_idx.index):
-            row_idx = buy_dates_idx[b_idx]
-            years_passed = month_count // 12
-            current_sip_amount = amount * ((1 + step_up_pct / 100.0) ** years_passed)
-            
-            price = asset_prices[row_idx]
-            if not np.isnan(price) and price > 0:
-                units_bought[row_idx] = np.round(current_sip_amount / price, 4)
-            invested_tracking[row_idx] = current_sip_amount
-            month_count += 1
-            
-        cumulative_units = np.cumsum(units_bought)
-        cumulative_invested = np.cumsum(invested_tracking)
-        
-        result_df[asset] = cumulative_units * asset_prices
-        total_invested_df[asset] = cumulative_invested
-
-# --- Tax / Inflation Adjustments ---
-if apply_taxes_inflation:
-    date_diff_years = (result_df['Date'] - result_df['Date'].iloc[0]).dt.days / 365.25
-    date_diff_years = date_diff_years.replace(0, 0.0001)
-    
-    for asset in assets:
-        gross_profit = result_df[asset] - total_invested_df[asset]
-        taxable_profit = (gross_profit - 125000).clip(lower=0)
-        tax_amount = taxable_profit * (tax_rate / 100.0)
-        
-        post_tax_value = result_df[asset] - tax_amount
-        real_value = post_tax_value / ((1 + (inflation_rate / 100.0)) ** date_diff_years)
-        result_df[asset] = real_value
-
-
-# --- Plotly color palette (mirrors Plotly's default sequence) ---
-_PLOTLY_PALETTE = [
-    '#636EFA', '#EF553B', '#00CC96', '#AB63FA', '#FFA15A',
-    '#19D3F3', '#FF6692', '#B6E880', '#FF97FF', '#FECB52'
-]
-
-# Build unique legend names: deduplicate after boilerplate stripping
-from collections import Counter as _Counter
-_raw_shorts = {f: _short_name(f) for f in mf_dfs.keys()}
-_dup_counts = _Counter(_raw_shorts.values())
-_dup_idx: dict = {}
-LEGEND_NAMES: dict = {}
-for _f, _s in _raw_shorts.items():
-    if _dup_counts[_s] > 1:
-        _dup_idx[_s] = _dup_idx.get(_s, 0) + 1
-        LEGEND_NAMES[_f] = f"{_s} ({_dup_idx[_s]})"
-    else:
-        LEGEND_NAMES[_f] = _s
-
-# Assign explicit colors per asset so chart ↔ table match perfectly
-ASSET_COLORS: dict = {selected_benchmark_name: _PLOTLY_PALETTE[0]}
-for _i, _f in enumerate(mf_dfs.keys(), start=1):
-    ASSET_COLORS[_f] = _PLOTLY_PALETTE[_i % len(_PLOTLY_PALETTE)]
-
-# --- Universal Callbacks and Data Prep ---
-tab_perf, tab_risk, tab_news = st.tabs(["Performance", "Risk & Consistency", "Market News"])
-
-def calc_return(invested, final_val, yrs):
-    if yrs <= 0 or invested <= 0:
-        return 0.0
-    return ((final_val / invested) ** (1/yrs) - 1) * 100
-
-def calc_abs_return(invested, final_val):
-    if invested <= 0:
-        return 0.0
-    return ((final_val - invested) / invested) * 100
-
-def color_formatting(val):
-    if pd.isna(val) or val == "-":
-        return ''
-    try:
-        if float(val) > 0:
-            return 'color: #00FF00;'
-        elif float(val) < 0:
-            return 'color: #FF0000;'
-    except:
-        pass
-    return 'color: gray;'
-
-def get_true_metrics(asset_col):
-    """ Extract exact metrics securely bypassing global forward-fill extrapolation bounds natively """
-    valid_series = filtered_df[asset_col].dropna()
-    if valid_series.empty:
-        return 0.0, 0.0, 0.0001
-        
-    last_valid_idx = valid_series.index[-1]
-    first_valid_idx = valid_series.index[0]
-    
-    final_val = result_df[asset_col].loc[last_valid_idx]
-    invest_val = total_invested_df[asset_col].loc[last_valid_idx]
-    
-    true_elapsed = (filtered_df['Date'].loc[last_valid_idx] - filtered_df['Date'].loc[first_valid_idx]).days / 365.25
-    if true_elapsed <= 0:
-        true_elapsed = 0.0001
-        
-    return final_val, invest_val, true_elapsed
-
-benchmark_final, benchmark_invested, bm_years = get_true_metrics('Index_Close')
-benchmark_ret = calc_return(benchmark_invested, benchmark_final, bm_years) if benchmark_invested > 0 else 0.0
-benchmark_abs_ret = calc_abs_return(benchmark_invested, benchmark_final) if benchmark_invested > 0 else 0.0
-
-bm_metrics_data = [{
-    "Asset Name": selected_benchmark_name,
-    "Total Invested (₹)": benchmark_invested,
-    "Final Value (₹)": benchmark_final,
-    "Absolute Return (%)": benchmark_abs_ret,
-    "Annualized Return (%)": benchmark_ret,
-    "Outperformance (%)": np.nan
-}]
-
-fund_metrics_data = []
-
-for fname in mf_dfs.keys():
-    fund_final, fund_invested, fund_years = get_true_metrics(fname)
-    
-    if fund_final == 0:
-        continue
-        
-    fund_ret = calc_return(fund_invested, fund_final, fund_years)
-    fund_abs_ret = calc_abs_return(fund_invested, fund_final)
-    outperf = fund_ret - benchmark_ret
-    
-    fund_metrics_data.append({
-        "Asset Name": fname,
-        "Total Invested (₹)": fund_invested,
-        "Final Value (₹)": fund_final,
-        "Absolute Return (%)": fund_abs_ret,
-        "Annualized Return (%)": fund_ret,
-        "Outperformance (%)": outperf
-    })
-
-# --- TAB 1: PERFORMANCE ---
-with tab_perf:
-    st.subheader("Performance Scorecards")
-    cols = st.columns(len(assets))
-    with cols[0]:
-        st.metric(
-            label=f"{selected_benchmark_name} (Benchmark)", 
-            value=_fmt_inr(benchmark_final), 
-            delta=f"{benchmark_abs_ret:.2f}%"
-        )
-        
-    for idx, fname in enumerate(mf_dfs.keys(), start=1):
-        f_final, f_inv, f_yrs = get_true_metrics(fname)
-        f_abs_ret = calc_abs_return(f_inv, f_final)
-        
-        if idx < len(cols):
-            with cols[idx]:
-                st.metric(
-                    label=fname, 
-                    value=_fmt_inr(f_final) if f_final > 0 else "-", 
-                    delta=f"{f_abs_ret:.2f}%" if f_final > 0 else "-"
-                )
-
-    st.write("---")
-    
-    # Plotly Canvas
-    fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=result_df['Date'],
-        y=result_df['Index_Close'],
-        mode='lines',
-        name=selected_benchmark_name,
-        line=dict(width=2, color=ASSET_COLORS[selected_benchmark_name]),
-        hovertemplate="<b>" + selected_benchmark_name + "</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
-    ))
-
-    for fname in mf_dfs.keys():
-        n_rows = len(result_df)
-        fig.add_trace(go.Scatter(
-            x=result_df['Date'],
-            y=result_df[fname],
-            mode='lines',
-            name=LEGEND_NAMES[fname],
-            line=dict(color=ASSET_COLORS[fname]),
-            customdata=[fname] * n_rows,
-            hovertemplate="<b>%{customdata}</b><br>Value: ₹ %{y:,.0f}<extra></extra>"
-        ))
-
-    fig.update_layout(
-        title=f"Portfolio Growth via {investment_type} (From {start_dt.strftime('%b %d, %Y')} to {end_dt.strftime('%b %d, %Y')})",
-        hovermode="x unified",
-        yaxis=dict(title="Portfolio Value (₹)", tickformat=","),
-        xaxis=dict(title=""),
-        margin=dict(l=0, r=0, t=50, b=0)
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Core Metric Tables
-    format_dict = {
-        "Total Invested (₹)": _fmt_inr,
-        "Final Value (₹)": _fmt_inr,
-        "Absolute Return (%)": "{:.2f}%", 
-        "Annualized Return (%)": "{:.2f}%", 
-        "Outperformance (%)": lambda x: f"{x:.2f}%" if pd.notna(x) else "-"
-    }
-    
-    def _style_asset_col(series):
-        """Color each Asset Name cell to match its chart trace colour."""
-        return [
-            f'color: {ASSET_COLORS.get(v, "inherit")}; font-weight: 600'
-            for v in series
-        ]
-
-    bm_df = pd.DataFrame(bm_metrics_data)
-    fund_df = pd.DataFrame(fund_metrics_data)
-
-    st.subheader("Benchmark Index")
-    st.dataframe(
-        bm_df.style
-            .format(format_dict)
-            .apply(_style_asset_col, subset=["Asset Name"]),
-        use_container_width=True, hide_index=True
-    )
-
-    st.subheader("Mutual Funds")
-    if not fund_df.empty:
-        styled_fund_df = (
-            fund_df.style
-                .format(format_dict)
-                .apply(_style_asset_col, subset=["Asset Name"])
-                .map(color_formatting, subset=["Absolute Return (%)", "Annualized Return (%)", "Outperformance (%)"])
-        )
-        st.dataframe(styled_fund_df, use_container_width=True, hide_index=True)
-
-    export_df = pd.concat([bm_df, fund_df], ignore_index=True)
-    csv_data = export_df.to_csv(index=False)
-    st.download_button(
-        label="Download Analysis Report (CSV)", 
-        data=csv_data, 
-        file_name='MF_Analysis.csv', 
-        mime='text/csv'
-    )
-
-
-# --- TAB 2: RISK & CONSISTENCY ---
-with tab_risk:
-    st.subheader("Risk & Consistency Analytics")
-    st.markdown("""
-    **Metrics Overview:**
-    - **Best / Worst 1-Year Return:** Highest and lowest return across any rolling 12-month window in the selected period.
-    - **Max Drawdown:** Largest peak-to-trough NAV decline — the worst loss you could have suffered buying at a local high.
-    - **Annualised Volatility:** Standard deviation of daily returns scaled to a year. Lower = smoother ride.
-    - **Loss-Making Years:** Count of calendar years the fund closed in the red.
-    - **Years to Double:** Rule-of-72 estimate using the selected-period CAGR.
-    """)
-
-    bm_risk_data = []
-    fund_risk_data = []
-
-    for asset in assets:
-        is_index = (asset == 'Index_Close')
-        asset_label = selected_benchmark_name if is_index else asset
-
-        asset_prices = sim_df[asset].dropna()
-        if asset_prices.empty:
-            continue
-
-        total_days = len(asset_prices)
-
-        # Rolling 1-year best / worst
-        if total_days > 252:
-            rolling_1y = asset_prices.pct_change(periods=252).dropna() * 100
-            best_1y  = rolling_1y.max()
-            worst_1y = rolling_1y.min()
-        else:
-            best_1y = worst_1y = np.nan
-
-        # Max drawdown: largest peak-to-trough percentage decline
-        cummax       = asset_prices.expanding().max()
-        drawdown_pct = (asset_prices - cummax) / cummax * 100
-        max_drawdown = drawdown_pct.min()
-
-        # Annualised volatility (std of daily returns × √252)
-        daily_rets = asset_prices.pct_change().dropna()
-        ann_vol    = daily_rets.std() * np.sqrt(252) * 100 if len(daily_rets) > 1 else np.nan
-
-        # Calendar-year loss count
-        prices_with_dates = sim_df.set_index('Date')[asset].dropna()
-        yearly_prices     = prices_with_dates.resample('YE').last()
-        yearly_returns    = yearly_prices.pct_change() * 100
-        loss_making_years = int((yearly_returns < 0).sum())
-
-        # Years to double via Rule of 72 (uses selected-period CAGR)
-        end_val, invest_val, asset_years = get_true_metrics(asset)
-        asset_cagr     = calc_return(invest_val, end_val, asset_years)
-        years_to_double = (72 / asset_cagr) if asset_cagr > 0 else np.nan
-
-        risk_row = {
-            "Asset Name":                asset_label,
-            "Best 1-Year Return (%)": best_1y,
-            "Worst 1-Year Return (%)": worst_1y,
-            "Max Drawdown (%)": max_drawdown,
-            "Annualised Volatility (%)": ann_vol,
-            "Loss-Making Years":         loss_making_years,
-            "Years to Double":           years_to_double,
-        }
-
-        if is_index:
-            bm_risk_data.append(risk_row)
-        else:
-            fund_risk_data.append(risk_row)
-
-    risk_format_dict = {
-        "Best 1-Year Return (%)": "{:.2f}%",
-        "Worst 1-Year Return (%)": "{:.2f}%",
-        "Max Drawdown (%)": "{:.2f}%",
-        "Annualised Volatility (%)": "{:.2f}%",
-        "Years to Double": "{:.1f} yrs",
-    }
-    _risk_color_cols = ["Best 1-Year Return (%)", "Worst 1-Year Return (%)", "Max Drawdown (%)"]
-
-    st.subheader("Benchmark Index")
-    st.dataframe(
-        pd.DataFrame(bm_risk_data).style
-            .format(risk_format_dict, na_rep="-")
-            .apply(_style_asset_col, subset=["Asset Name"]),
-        use_container_width=True, hide_index=True
-    )
-
-    st.subheader("Mutual Funds")
-    if fund_risk_data:
-        fund_risk_df = pd.DataFrame(fund_risk_data)
-        st.dataframe(
-            fund_risk_df.style
-                .format(risk_format_dict, na_rep="-")
-                .apply(_style_asset_col, subset=["Asset Name"])
-                .map(color_formatting, subset=_risk_color_cols),
-            use_container_width=True,
-            hide_index=True
-        )
-
-
-# --- TAB 3: MARKET NEWS ---
-
-# Maps keywords found in fund names → (Google News search query, human-readable theme label)
-# Ordered by specificity (more specific patterns first)
-_THEME_MAP = [
-    (['NIFTY 50',  'NIFTY50',  'NIFTY NEXT 50'],        'Nifty 50 NSE index India stocks',              'Nifty 50 / Large Cap Index'),
-    (['NIFTY MIDCAP', 'MIDCAP', 'MID CAP'],             'NSE midcap India equity stocks market',         'Mid Cap Equity'),
-    (['SMALL CAP', 'SMALLCAP'],                          'NSE smallcap India equity stocks market',       'Small Cap Equity'),
-    (['SENSEX', 'BSE 500', 'BSE 200'],                   'BSE Sensex India stocks market',                'BSE Index'),
-    (['BANKING & PSU', 'BANKING AND PSU', 'PSU DEBT'],   'Indian banking PSU bonds RBI debt market',      'Banking & PSU Debt'),
-    (['BANKING', 'BANK', 'FINANCIAL SERVICES'],          'Indian banking sector stocks NSE BSE',          'Banking & Financial Services'),
-    (['CORPORATE BOND', 'CREDIT RISK'],                  'India corporate bonds credit market yield',     'Corporate Bonds'),
-    (['OVERNIGHT', 'LIQUID'],                            'RBI repo rate India money market overnight',    'Money Market / Overnight'),
-    (['GILT', 'GSEC', 'G-SEC', 'GOVERNMENT SECURITIES'], 'RBI India government securities gilt bonds',   'Government Securities / Gilt'),
-    (['IT', 'TECHNOLOGY', 'TECH'],                       'India IT technology sector stocks Infosys TCS', 'Technology Sector'),
-    (['PHARMA', 'HEALTHCARE', 'HEALTH CARE'],             'India pharma healthcare stocks market NSE',     'Pharma & Healthcare'),
-    (['INFRASTRUCTURE', 'INFRA'],                        'India infrastructure sector stocks market',     'Infrastructure'),
-    (['INTERNATIONAL', 'GLOBAL', 'US', 'NASDAQ'],        'global equity markets international index',     'International / Global'),
-    (['FLEXI CAP', 'FLEXICAP', 'MULTI CAP', 'MULTICAP'], 'Indian equity market diversified stocks NSE',   'Flexi / Multi Cap'),
-    (['ETF'],                                            'India ETF NSE index market',                   'ETF'),
-]
-
-def _get_fund_theme(fund_name: str):
-    """Return (search_query, theme_label) for a fund based on keywords in its name."""
-    name = fund_name.upper()
-    for keywords, query, label in _THEME_MAP:
-        if any(kw in name for kw in keywords):
-            return query, label
-    return 'Indian stock market mutual funds NSE BSE', 'General Equity'
-
-# --- NewsAPI config ---
-_NEWSAPI_KEY = "918c748329664746ab1b86af41376a6f"
-# Trusted Indian & global financial outlets — filtered server-side by NewsAPI
-_NEWSAPI_DOMAINS = (
+# Trusted financial outlets for NewsAPI (only used when a key is configured).
+NEWSAPI_DOMAINS = (
     "economictimes.indiatimes.com,livemint.com,business-standard.com,"
     "moneycontrol.com,thehindu.com,reuters.com,businesstoday.in,"
     "financialexpress.com,ndtvprofit.com,thehindubusinessline.com"
 )
 
-@st.cache_data(ttl=3600)
-def _fetch_newsapi(query: str, max_results: int = 5):
-    """Fetch structured news from NewsAPI — filtered to trusted sources, cached 1 hour."""
-    params = {
-        "q":        query,
-        "language": "en",
-        "sortBy":   "publishedAt",
-        "pageSize": max_results,
-        "domains":  _NEWSAPI_DOMAINS,
-        "apiKey":   _NEWSAPI_KEY,
+
+# =============================================================================
+# Formatting helpers
+# =============================================================================
+
+def fmt_inr(value) -> str:
+    """Format a number with Indian digit grouping, e.g. ₹12,34,567."""
+    try:
+        v = int(round(float(value)))
+    except (TypeError, ValueError):
+        return "–"
+    sign = "-" if v < 0 else ""
+    s = str(abs(v))
+    if len(s) > 3:
+        head, tail = s[:-3], s[-3:]
+        parts = []
+        while head:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        s = ",".join(parts) + "," + tail
+    return f"₹{sign}{s}"
+
+
+def fmt_inr_compact(value) -> str:
+    """Compact rupee figure for headline numbers: ₹12.35 L, ₹1.20 Cr."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "–"
+    if np.isnan(v):
+        return "–"
+    a = abs(v)
+    if a >= 1e7:
+        return f"₹{v / 1e7:,.2f} Cr"
+    if a >= 1e5:
+        return f"₹{v / 1e5:,.2f} L"
+    return fmt_inr(v)
+
+
+def fmt_pct(value, signed: bool = False, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "–"
+    return f"{value:+.{digits}f}%" if signed else f"{value:.{digits}f}%"
+
+
+def styled_table(df: pd.DataFrame, formats: dict, signed: list[str],
+                 swatches: dict) -> "pd.io.formats.style.Styler":
+    """Pre-format numbers as text, colour signed columns green/red and mark
+    each row with its series colour.
+
+    Values are formatted up front because st.dataframe shows missing values
+    as "None" whatever the Styler's na_rep, and mixed str/float columns fail
+    Arrow serialisation.
+    """
+    disp = df.copy()
+    for col, fn in formats.items():
+        disp[col] = [("–" if pd.isna(v) else fn(v)) for v in df[col]]
+
+    def sign_css(col):
+        return ["" if pd.isna(v) or v == 0 else
+                f"color: {POS_COLOR if v > 0 else NEG_COLOR}" for v in df[col.name]]
+
+    def swatch_css(col):
+        return [f"border-left: 4px solid {swatches.get(v, 'transparent')}" for v in col]
+
+    return (disp.style.apply(sign_css, subset=signed)
+            .apply(swatch_css, subset=[df.columns[0]]))
+
+
+def short_name(name: str, max_len: int = 38) -> str:
+    """Concise label for legends and cards; keeps Direct/Regular visible."""
+    q = name.upper()
+    q = re.sub(r"\(FORMERLY KNOWN AS[^)]*\)", "", q)
+    q = re.sub(r"INCOME DISTRIBUTION CUM CAPITAL WITHDRAWAL OPTION.*", "", q)
+    q = re.sub(r"\(PAYOUT\s*&?\s*REINVESTMENT\)", "", q)
+    q = re.sub(r"\b(REINVESTMENT|PAYOUT)\b", "", q)
+    q = re.sub(r"-?\s*DIRECT PLAN\b", " (D)", q)
+    q = re.sub(r"-?\s*REGULAR PLAN\b", " (R)", q)
+    q = re.sub(
+        r"-?\s*\b(FORTNIGHTLY|MONTHLY|QUARTERLY|ANNUAL|DAILY|WEEKLY|"
+        r"GROWTH OPTION|GROWTH|IDCW|BONUS|OPTION|PLAN)\b", "", q
+    )
+    q = re.sub(r"\s+", " ", q).strip(" -")
+    q = " ".join(w if w in ACRONYMS or not re.search(r"[AEIOU]", w) else w.title()
+                 for w in q.split())
+    # Truncate the name, never the plan tag that tells Direct from Regular.
+    m = re.search(r"\s*\((D|R)\)", q)
+    plan = {"D": " (Direct)", "R": " (Regular)"}[m.group(1)] if m else ""
+    q = re.sub(r"\s*\((D|R)\)", "", q).strip(" -")
+    limit = max_len - len(plan)
+    if len(q) > limit:
+        q = q[:limit].rstrip(" -") + "…"
+    return q + plan
+
+
+# =============================================================================
+# Data fetching
+# Cached functions raise on failure: st.cache_data does not cache exceptions,
+# so a transient network error is retried on the next run instead of being
+# remembered for the whole TTL.
+# =============================================================================
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_active_funds() -> dict:
+    res = requests.get("https://www.amfiindia.com/spages/NAVAll.txt", timeout=20)
+    res.raise_for_status()
+    funds = {}
+    for line in res.text.splitlines():
+        parts = line.split(";")
+        if len(parts) >= 6 and parts[0].strip().isdigit():
+            name = parts[3].strip().upper()
+            if name and not any(w in name for w in EXCLUDE_WORDS):
+                funds[name] = parts[0].strip()
+    if not funds:
+        raise ValueError("AMFI fund list was empty")
+    return dict(sorted(funds.items()))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_nav_history(scheme_code: str) -> pd.DataFrame:
+    res = requests.get(f"https://api.mfapi.in/mf/{scheme_code}", timeout=20)
+    res.raise_for_status()
+    data = res.json().get("data") or []
+    if not data:
+        raise ValueError(f"No NAV history for scheme {scheme_code}")
+    df = pd.DataFrame(data)
+    df["Date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
+    df["NAV"] = pd.to_numeric(df["nav"], errors="coerce")
+    df = df[df["NAV"] > 0].drop_duplicates("Date").sort_values("Date")
+    return df[["Date", "NAV"]].reset_index(drop=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_index_history(ticker: str, start: str = "2000-01-01") -> pd.DataFrame:
+    df = yf.download(ticker, start=start, progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        raise ValueError(f"No data for {ticker}")
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.reset_index()[["Date", "Close"]].dropna()
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None).dt.normalize()
+    return df.rename(columns={"Close": "Index"}).sort_values("Date").reset_index(drop=True)
+
+
+# =============================================================================
+# Finance maths
+# =============================================================================
+
+def xirr(flows) -> float:
+    """Annualised money-weighted return (%) for [(date, amount), ...].
+
+    Outflows (investments) are negative, the closing value positive.
+    Solved by bisection, which is robust for the single sign-change cash
+    flows produced by lumpsum and SIP investing.
+    """
+    if len(flows) < 2:
+        return np.nan
+    d0 = flows[0][0]
+    t = np.array([(d - d0).days / 365.25 for d, _ in flows])
+    cf = np.array([a for _, a in flows], dtype=float)
+    if t[-1] <= 0 or not (cf < 0).any() or not (cf > 0).any():
+        return np.nan
+
+    def npv(r):
+        return float(np.sum(cf / (1.0 + r) ** t))
+
+    lo, hi = -0.9999, 10.0
+    f_lo, f_hi = npv(lo), npv(hi)
+    if np.sign(f_lo) == np.sign(f_hi):
+        return np.nan
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        f_mid = npv(mid)
+        if abs(f_mid) < 1e-6:
+            break
+        if np.sign(f_mid) == np.sign(f_lo):
+            lo, f_lo = mid, f_mid
+        else:
+            hi = mid
+    return mid * 100
+
+
+def price_cagr(series: pd.Series) -> float:
+    """CAGR (%) of a date-indexed price series."""
+    s = series.dropna()
+    if len(s) < 2:
+        return np.nan
+    yrs = (s.index[-1] - s.index[0]).days / 365.25
+    if yrs <= 0 or s.iloc[0] <= 0:
+        return np.nan
+    return ((s.iloc[-1] / s.iloc[0]) ** (1 / yrs) - 1) * 100
+
+
+def simulate(dates: pd.Series, prices: pd.Series, mode: str, amount: float,
+             step_up: float, start_idx: int = 0) -> dict | None:
+    """Simulate a lumpsum or SIP on a price series aligned to `dates`.
+
+    `prices` may contain NaN before the asset's inception; nothing is
+    invested before the first valid price, so a fund launched mid-period is
+    never "bought" at a back-filled NAV.
+    """
+    p = prices.ffill().to_numpy(dtype=float)
+    n = len(p)
+    valid = ~np.isnan(p)
+    valid[:start_idx] = False
+    if not valid.any():
+        return None
+    first = int(np.argmax(valid))
+
+    contrib = np.zeros(n)
+    units = np.zeros(n)
+    if mode == "Lumpsum":
+        contrib[first] = amount
+        units[first] = amount / p[first]
+    else:
+        months = dates.dt.to_period("M").to_numpy()
+        seen, k = set(), 0
+        for i in range(first, n):
+            if months[i] in seen:
+                continue
+            seen.add(months[i])
+            instalment = amount * (1 + step_up / 100) ** (k // 12)
+            contrib[i] = instalment
+            units[i] = instalment / p[i]
+            k += 1
+
+    value = np.cumsum(units) * p
+    invested = np.cumsum(contrib)
+    value[:first] = np.nan
+    invested[:first] = np.nan
+    return {"value": value, "invested": invested, "contrib": contrib, "first": first}
+
+
+def apply_tax_inflation(sim: dict, dates: pd.Series, tax_rate: float,
+                        inflation: float) -> dict:
+    """Express a simulation in post-tax, start-of-period rupees.
+
+    Tax: LTCG on gains above the ₹1.25 L exemption, as if redeemed on that day.
+    Inflation: every amount (value and each contribution) is deflated back to
+    the first date of the selected period, so returns become real returns.
+    """
+    yrs = (dates - dates.iloc[0]).dt.days.to_numpy() / 365.25
+    deflator = (1 + inflation / 100) ** yrs
+    gain = sim["value"] - sim["invested"]
+    tax = np.clip(gain - LTCG_EXEMPTION, 0, None) * tax_rate / 100
+    real_contrib = sim["contrib"] / deflator
+    invested = np.cumsum(real_contrib)
+    invested[: sim["first"]] = np.nan
+    return {
+        "value": (sim["value"] - tax) / deflator,
+        "invested": invested,
+        "contrib": real_contrib,
+        "first": sim["first"],
     }
-    resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    articles = []
-    for art in data.get("articles", []):
-        articles.append({
-            "title":  art.get("title", "Article"),
-            "url":    art.get("url", ""),
-            "body":   art.get("description") or "",
-            "source": art.get("source", {}).get("name", ""),
-            "date":   art.get("publishedAt", "")[:10],
+
+
+def summarise(sim: dict, dates: pd.Series) -> dict:
+    """Headline numbers for a simulation."""
+    value, invested = sim["value"][-1], sim["invested"][-1]
+    flows = [(dates.iloc[i], -c) for i, c in enumerate(sim["contrib"]) if c > 0]
+    flows.append((dates.iloc[-1], value))
+    years = (dates.iloc[-1] - dates.iloc[sim["first"]]).days / 365.25
+    return {
+        "invested": invested,
+        "value": value,
+        "gain": value - invested,
+        "abs_ret": (value / invested - 1) * 100 if invested > 0 else np.nan,
+        # Annualising sub-one-year returns is misleading (AMFI convention).
+        "ann_ret": xirr(flows) if years >= 1 else np.nan,
+        "years": years,
+        "start": dates.iloc[sim["first"]],
+    }
+
+
+def risk_metrics(series: pd.Series) -> dict:
+    """Risk statistics from an asset's own (un-filled) price observations."""
+    s = series.dropna()
+    s = s[~s.index.duplicated()]
+    out = dict.fromkeys(["best_1y", "worst_1y", "max_dd", "vol", "loss_years",
+                         "cagr", "double"], np.nan)
+    if len(s) < 2:
+        return out
+
+    # Rolling one-year returns, by calendar date rather than row count.
+    lag_dates = s.index - pd.DateOffset(years=1)
+    eligible = lag_dates >= s.index[0]
+    if eligible.any():
+        lagged = s.reindex(lag_dates[eligible], method="ffill").to_numpy()
+        roll = (s[eligible].to_numpy() / lagged - 1) * 100
+        out["best_1y"], out["worst_1y"] = np.nanmax(roll), np.nanmin(roll)
+
+    out["max_dd"] = ((s / s.cummax()) - 1).min() * 100
+    rets = s.pct_change().dropna()
+    if len(rets) > 1:
+        out["vol"] = rets.std() * np.sqrt(252) * 100
+
+    year_end = s.resample("YE").last()
+    out["loss_years"] = int((year_end.pct_change().dropna() < 0).sum())
+
+    out["cagr"] = price_cagr(s)
+    if out["cagr"] > 0:
+        out["double"] = np.log(2) / np.log(1 + out["cagr"] / 100)
+    return out
+
+
+# =============================================================================
+# News
+# =============================================================================
+
+# (keywords matched as whole words, search query, label). More specific first.
+THEMES = [
+    (["NIFTY 50", "NIFTY50", "NIFTY NEXT 50", "LARGE CAP", "LARGE-CAP", "LARGECAP", "BLUECHIP", "BLUE CHIP"],
+     "Nifty 50 large cap stocks India", "Large Cap"),
+    (["MIDCAP", "MID CAP", "MID-CAP"], "midcap stocks India NSE", "Mid Cap"),
+    (["SMALLCAP", "SMALL CAP", "SMALL-CAP"], "smallcap stocks India NSE", "Small Cap"),
+    (["SENSEX"], "Sensex BSE India stocks", "Sensex"),
+    (["BANKING & PSU", "BANKING AND PSU", "PSU DEBT"], "banking PSU bonds India RBI", "Banking & PSU Debt"),
+    (["BANKING", "BANK", "FINANCIAL SERVICES"], "Indian banking sector stocks", "Banking & Financial Services"),
+    (["CORPORATE BOND", "CREDIT RISK"], "India corporate bond yields", "Corporate Bonds"),
+    (["OVERNIGHT", "LIQUID", "MONEY MARKET"], "RBI repo rate money market India", "Money Market"),
+    (["GILT", "GSEC", "G-SEC", "GOVERNMENT SECURITIES"], "India government bond yields RBI", "Gilt"),
+    (["IT", "TECHNOLOGY", "TECH", "DIGITAL"], "India IT sector stocks Infosys TCS", "Technology"),
+    (["PHARMA", "HEALTHCARE", "HEALTH CARE"], "India pharma healthcare stocks", "Pharma & Healthcare"),
+    (["INFRASTRUCTURE", "INFRA"], "India infrastructure stocks", "Infrastructure"),
+    (["GOLD", "SILVER"], "gold silver prices India", "Precious Metals"),
+    (["INTERNATIONAL", "GLOBAL", "US", "NASDAQ", "S&P 500", "FOF OVERSEAS"], "global equity markets US stocks", "International"),
+    (["ELSS", "TAX SAVER"], "ELSS tax saver mutual funds India", "ELSS / Tax Saver"),
+    (["HYBRID", "BALANCED", "ARBITRAGE", "MULTI ASSET", "EQUITY & DEBT", "EQUITY SAVINGS"], "hybrid mutual funds India market", "Hybrid"),
+    (["FLEXI CAP", "FLEXICAP", "MULTI CAP", "MULTICAP", "FOCUSED", "VALUE", "CONTRA"],
+     "Indian equity market Nifty Sensex", "Diversified Equity"),
+]
+
+
+def fund_theme(fund_name: str) -> tuple[str, str]:
+    name = fund_name.upper()
+    for keywords, query, label in THEMES:
+        # Whole-word match: plain substring matching sent every "EQUITY"
+        # fund to Technology ("IT") and "FOCUSED" funds to International ("US").
+        if any(re.search(rf"(?<![A-Z0-9]){re.escape(kw)}(?![A-Z0-9])", name) for kw in keywords):
+            return query, label
+    return "Indian stock market mutual funds", "Indian Markets"
+
+
+def _newsapi_key() -> str | None:
+    try:
+        return st.secrets.get("NEWSAPI_KEY")
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_news(query: str, limit: int = 6) -> list[dict]:
+    key = _newsapi_key()
+    if key:
+        res = requests.get("https://newsapi.org/v2/everything", timeout=10, params={
+            "q": query, "language": "en", "sortBy": "publishedAt",
+            "pageSize": limit, "domains": NEWSAPI_DOMAINS, "apiKey": key,
         })
-    return articles
+        res.raise_for_status()
+        return [{
+            "title": a.get("title") or "Untitled",
+            "url": a.get("url") or "",
+            "source": (a.get("source") or {}).get("name", ""),
+            "date": (a.get("publishedAt") or "")[:10],
+        } for a in res.json().get("articles", [])]
 
-
-with tab_news:
-    st.subheader("Market News")
-    st.caption("News grouped by each fund's investment theme, sourced from NewsAPI. Refreshes hourly.")
-
-    # Group selected funds by theme — avoid duplicate queries for same theme
-    from collections import defaultdict
-    theme_groups  = defaultdict(list)   # label → [fund names]
-    theme_queries = {}                  # label → search query
-
-    for fname in mf_dfs.keys():
-        query, label = _get_fund_theme(fname)
-        theme_groups[label].append(fname)
-        theme_queries[label] = query
-
-    for label, fund_names in theme_groups.items():
-        query = theme_queries[label]
-        st.markdown(f"### {label}")
-        st.caption("Funds in this theme: " + "  ·  ".join(f"`{n}`" for n in fund_names))
-
+    # Keyless fallback: Google News RSS.
+    res = requests.get("https://news.google.com/rss/search", timeout=10, params={
+        "q": f"{query} when:14d", "hl": "en-IN", "gl": "IN", "ceid": "IN:en",
+    })
+    res.raise_for_status()
+    items = []
+    for item in ET.fromstring(res.content).iter("item"):
+        title = item.findtext("title") or "Untitled"
+        source = item.findtext("source") or ""
+        if source and title.endswith(f" - {source}"):
+            title = title[: -len(source) - 3]
         try:
-            articles = _fetch_newsapi(query)
-            if articles:
-                for art in articles:
-                    with st.expander(art['title']):
-                        meta = "  ·  ".join(filter(None, [art['source'], art['date']]))
-                        if meta:
-                            st.caption(meta)
-                        if art['body']:
-                            st.write(art['body'])
-                        if art['url']:
-                            st.markdown(f"[Read Full Article]({art['url']})")
-            else:
-                st.info("No recent articles found for this theme.")
-        except Exception as e:
-            st.warning(f"Could not load news for '{label}' ({e.__class__.__name__}). Check your connection.")
+            date = parsedate_to_datetime(item.findtext("pubDate")).strftime("%Y-%m-%d")
+        except Exception:
+            date = ""
+        items.append({"title": title, "url": item.findtext("link") or "",
+                      "source": source, "date": date})
+        if len(items) >= limit:
+            break
+    return items
 
-        st.write("---")
 
+# =============================================================================
+# Page setup
+# =============================================================================
+
+st.set_page_config(page_title="MF Growth Analyser", layout="wide")
+
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 2.2rem; padding-bottom: 3rem; max-width: 1320px; }
+      h1 { font-weight: 650; letter-spacing: -0.02em; margin-bottom: 0 !important; }
+      h3 { font-weight: 600; letter-spacing: -0.01em; }
+      [data-testid="stMetricLabel"] p { font-size: 0.82rem; color: #5f5e5a; }
+      [data-testid="stMetricValue"] { font-size: 1.55rem; font-variant-numeric: tabular-nums; }
+      .mfga-sub { color: #5f5e5a; font-size: 0.95rem; margin: 0.15rem 0 1.2rem; }
+      .mfga-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+                     margin-right: 6px; vertical-align: baseline; }
+      .mfga-news { padding: 0.55rem 0; border-bottom: 1px solid rgba(0,0,0,0.07); }
+      .mfga-news a { color: inherit; text-decoration: none; font-weight: 500; }
+      .mfga-news a:hover { text-decoration: underline; }
+      .mfga-meta { color: #75746f; font-size: 0.8rem; margin-top: 0.1rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("MF Growth Analyser")
+st.markdown(
+    '<p class="mfga-sub">Back-test Indian mutual funds against a market index '
+    "with lumpsum or SIP investing, using daily NAVs from AMFI.</p>",
+    unsafe_allow_html=True,
+)
+
+# --- Fund selection ----------------------------------------------------------
+try:
+    with st.spinner("Loading fund list…"):
+        all_funds = fetch_active_funds()
+except Exception as exc:
+    st.error(f"Could not load the AMFI fund list ({exc.__class__.__name__}). "
+             "Please refresh in a minute.")
+    st.stop()
+
+with st.container(border=True):
+    c_search, c_pick = st.columns([1, 3])
+    fund_search = c_search.text_input(
+        "Search funds", placeholder="AMC, category or keyword", key="fund_search_input"
+    )
+    terms = fund_search.upper().split()
+    filtered = [n for n in all_funds if all(t in n for t in terms)] if terms else list(all_funds)
+    # Keep current picks in the options so a new search never drops them.
+    current = st.session_state.get("fund_multiselect", [])
+    options = list(dict.fromkeys(current + filtered))
+    selected_funds = c_pick.multiselect(
+        f"Funds to compare (up to {MAX_FUNDS})",
+        options=options,
+        max_selections=MAX_FUNDS,
+        format_func=lambda n: short_name(n, 48),
+        placeholder=f"{len(filtered):,} funds match — choose up to {MAX_FUNDS}",
+        key="fund_multiselect",
+    )
+
+    c1, c2, c3, c4, c5 = st.columns([1.1, 1, 1.1, 1, 1.2])
+    benchmark_name = c1.selectbox("Benchmark", list(BENCHMARKS), index=0)
+    mode = c2.segmented_control("Investment", ["SIP", "Lumpsum"], default="SIP",
+                                key="mode") or "SIP"
+    amount = c3.number_input(
+        "Monthly SIP (₹)" if mode == "SIP" else "Lumpsum (₹)",
+        min_value=500, value=10_000 if mode == "SIP" else 1_00_000, step=500,
+    )
+    c3.caption(fmt_inr(amount))
+    step_up = c4.number_input("Annual step-up (%)", 0, 50, 0, 1, key="step_up",
+                              disabled=(mode != "SIP"))
+    step_up = step_up if mode == "SIP" else 0
+    real_terms = c5.toggle("Post-tax, inflation-adjusted",
+                           help="Deducts LTCG tax (above the ₹1.25 L exemption) as if "
+                                "redeemed on each date, and expresses all values in "
+                                "rupees of the period's start date.")
+    if real_terms:
+        t1, t2 = c5.columns(2)
+        tax_rate = t1.number_input("LTCG %", 0.0, 50.0, 12.5, 0.5)
+        inflation = t2.number_input("Inflation %", 0.0, 20.0, 5.5, 0.5)
+    else:
+        tax_rate = inflation = 0.0
+
+if not selected_funds:
+    st.info("Search for and select at least one fund to begin.")
+    st.stop()
+
+# --- Fetch data --------------------------------------------------------------
+with st.spinner("Fetching NAV and index history…"):
+    try:
+        index_df = fetch_index_history(BENCHMARKS[benchmark_name])
+    except Exception as exc:
+        st.error(f"Could not load {benchmark_name} data from Yahoo Finance "
+                 f"({exc.__class__.__name__}). Try another benchmark or refresh.")
+        st.stop()
+
+    nav = {}
+    failed = []
+    for fname in selected_funds:
+        try:
+            nav[fname] = fetch_nav_history(all_funds[fname]).rename(columns={"NAV": fname})
+        except Exception:
+            failed.append(fname)
+
+if failed:
+    st.warning("No NAV history available for: " + ", ".join(short_name(f) for f in failed))
+if not nav:
+    st.stop()
+
+funds = list(nav)
+merged = index_df
+for df in nav.values():
+    merged = merged.merge(df, on="Date", how="outer")
+merged = merged.sort_values("Date").reset_index(drop=True)
+
+# Labels and colours follow the fund (selection order), never its rank.
+_shorts = {f: short_name(f) for f in funds}
+_dupes = Counter(_shorts.values())
+_seen = Counter()
+LABEL = {"Index": benchmark_name}
+for f in funds:
+    s = _shorts[f]
+    if _dupes[s] > 1:
+        _seen[s] += 1
+        s = f"{s} #{_seen[s]}"
+    LABEL[f] = s
+COLOR = {"Index": BENCHMARK_COLOR}
+for i, f in enumerate(selected_funds):
+    if f in nav:
+        COLOR[f] = FUND_COLORS[i % len(FUND_COLORS)]
+assets = ["Index"] + funds
+
+# --- Period selection --------------------------------------------------------
+first_obs = merged.dropna(subset=assets, how="all")["Date"]
+min_date, max_date = first_obs.min(), merged["Date"].max()
+
+pc1, pc2 = st.columns([3, 2], vertical_alignment="bottom")
+period = pc1.segmented_control("Period", PERIODS, default="3Y", key="period") or "3Y"
+if period == "Custom":
+    rng = pc2.slider("Date range", min_value=min_date.date(), max_value=max_date.date(),
+                     value=(max(min_date, max_date - pd.DateOffset(years=3)).date(),
+                            max_date.date()),
+                     format="MMM YYYY")
+    start_dt, end_dt = pd.Timestamp(rng[0]), pd.Timestamp(rng[1])
+else:
+    end_dt = max_date
+    if period == "YTD":
+        start_dt = pd.Timestamp(max_date.year, 1, 1)
+    elif period == "Max":
+        start_dt = min_date
+    else:
+        start_dt = max_date - PERIOD_OFFSETS[period]
+    start_dt = max(start_dt, min_date)
+
+window = merged[(merged["Date"] >= start_dt) & (merged["Date"] <= end_dt)].reset_index(drop=True)
+if len(window) < 2:
+    st.warning("Not enough data in the selected range.")
+    st.stop()
+dates = window["Date"]
+start_dt, end_dt = dates.iloc[0], dates.iloc[-1]
+period_label = "custom range" if period == "Custom" else period
+
+# --- Simulate ----------------------------------------------------------------
+def run(asset: str, start_idx: int = 0):
+    sim = simulate(dates, window[asset], mode, amount, step_up, start_idx)
+    if sim is not None and real_terms:
+        sim = apply_tax_inflation(sim, dates, tax_rate, inflation)
+    return sim
+
+
+sims = {a: run(a) for a in assets}
+missing = [a for a in assets if sims[a] is None]
+for a in missing:
+    st.warning(f"{LABEL[a]} has no data in the selected period.")
+assets = [a for a in assets if sims[a] is not None]
+funds = [f for f in funds if f in assets]
+if not funds:
+    st.stop()
+
+summary = {a: summarise(sims[a], dates) for a in assets}
+
+# Outperformance is measured against the benchmark over the fund's own
+# window (same start date, same instalments), so a fund launched mid-period
+# is not compared with a longer benchmark history.
+for f in funds:
+    bm = summary.get("Index")
+    if bm is not None and sims[f]["first"] != sims["Index"]["first"]:
+        bm_sim = run("Index", sims[f]["first"])
+        bm = summarise(bm_sim, dates) if bm_sim is not None else None
+    summary[f]["vs_bm"] = (summary[f]["ann_ret"] - bm["ann_ret"]
+                           if bm is not None else np.nan)
+
+late_starters = [f for f in funds if summary[f]["start"] > start_dt + pd.Timedelta(days=7)]
+
+# =============================================================================
+# Output
+# =============================================================================
+
+value_word = "Real value" if real_terms else "Value"
+st.markdown(
+    f"**{mode}** of **{fmt_inr(amount)}**"
+    f"{' per month' if mode == 'SIP' else ''}"
+    f"{f', stepped up {step_up}% a year' if mode == 'SIP' and step_up else ''}"
+    f" · {start_dt:%d %b %Y} – {end_dt:%d %b %Y}"
+    f"{' · post-tax, in start-date rupees' if real_terms else ''}"
+)
+
+tab_perf, tab_risk, tab_plan, tab_news = st.tabs(
+    ["Performance", "Risk", "Goal planner", "News"]
+)
+
+# --- Performance -------------------------------------------------------------
+with tab_perf:
+    cols = st.columns(len(assets))
+    for col, a in zip(cols, assets):
+        s = summary[a]
+        ret = s["ann_ret"] if not pd.isna(s["ann_ret"]) else s["abs_ret"]
+        ret_kind = "a.a." if not pd.isna(s["ann_ret"]) else "abs."
+        col.metric(
+            label=LABEL[a] + (" · benchmark" if a == "Index" else ""),
+            value=fmt_inr_compact(s["value"]),
+            delta=f"{fmt_pct(ret, signed=True)} {ret_kind}",
+            border=True,
+            help=f"{a if a != 'Index' else benchmark_name}\n\n"
+                 f"Invested {fmt_inr(s['invested'])} · gain {fmt_inr(s['gain'])}",
+        )
+
+    fig = go.Figure()
+    for a in assets:
+        is_bm = a == "Index"
+        fig.add_trace(go.Scatter(
+            x=dates, y=sims[a]["value"], name=LABEL[a], mode="lines",
+            line=dict(color=COLOR[a], width=2, dash="dot" if is_bm else "solid"),
+            hovertemplate=f"{LABEL[a]}: %{{y:,.0f}}<extra></extra>",
+        ))
+    invested_ref = sims[funds[0]]
+    if all(sims[f]["first"] == invested_ref["first"] for f in funds):
+        fig.add_trace(go.Scatter(
+            x=dates, y=invested_ref["invested"], name="Amount invested", mode="lines",
+            line=dict(color="#b5b4ae", width=1.5, shape="hv"),
+            hovertemplate="Invested: %{y:,.0f}<extra></extra>",
+        ))
+    fig.update_layout(
+        **(CHART_LAYOUT | {"margin": dict(l=8, r=8, t=48, b=8)}),
+        height=460,
+        yaxis=dict(title=f"{value_word} (₹)", tickprefix="₹", tickformat=",.0f",
+                   gridcolor=GRID_COLOR, zeroline=False, automargin=True, rangemode="tozero"),
+        xaxis=dict(showgrid=False, automargin=True),
+    )
+    st.plotly_chart(fig, width="stretch", theme=None,
+                    config={"displaylogo": False, "modeBarButtonsToRemove": ["select2d", "lasso2d"]})
+    if late_starters:
+        st.caption("Launched after the period start, so simulated from first NAV: " +
+                   "; ".join(f"{LABEL[f]} ({summary[f]['start']:%b %Y})" for f in late_starters))
+
+    perf_rows = []
+    for a in assets:
+        s = summary[a]
+        perf_rows.append({
+            "Fund": LABEL[a] + (" (benchmark)" if a == "Index" else ""),
+            "Invested": s["invested"],
+            value_word: s["value"],
+            "Gain": s["gain"],
+            "Absolute return": s["abs_ret"],
+            "XIRR" if mode == "SIP" else "CAGR": s["ann_ret"],
+            f"vs {benchmark_name}": s.get("vs_bm", np.nan),
+        })
+    perf_df = pd.DataFrame(perf_rows)
+    ret_col = "XIRR" if mode == "SIP" else "CAGR"
+    color_by_label = {LABEL[a] + (" (benchmark)" if a == "Index" else ""): COLOR[a] for a in assets}
+
+    st.dataframe(
+        styled_table(
+            perf_df,
+            {"Invested": fmt_inr, value_word: fmt_inr, "Gain": fmt_inr,
+             "Absolute return": fmt_pct, ret_col: fmt_pct,
+             f"vs {benchmark_name}": lambda v: fmt_pct(v, signed=True)},
+            signed=["Gain", "Absolute return", ret_col, f"vs {benchmark_name}"],
+            swatches=color_by_label,
+        ),
+        width="stretch", hide_index=True,
+    )
+    st.caption(
+        f"{ret_col} is shown only for periods of a year or more. "
+        f"“vs {benchmark_name}” compares annualised returns over each fund's own "
+        "investment window. The benchmark is a price index (dividends excluded), "
+        "so it slightly understates the index's total return."
+    )
+
+    export = perf_df.copy()
+    export.insert(1, "Scheme", ["" if a == "Index" else a for a in assets])
+    st.download_button("Download results (CSV)", export.to_csv(index=False),
+                       file_name="mf_analysis.csv", mime="text/csv")
+
+# --- Risk --------------------------------------------------------------------
+with tab_risk:
+    series = {a: window.set_index("Date")[a].dropna() for a in assets}
+    risk_rows = []
+    for a in assets:
+        r = risk_metrics(series[a])
+        risk_rows.append({
+            "Fund": LABEL[a] + (" (benchmark)" if a == "Index" else ""),
+            "Price CAGR": r["cagr"],
+            "Volatility (ann.)": r["vol"],
+            "Max drawdown": r["max_dd"],
+            "Best 1Y": r["best_1y"],
+            "Worst 1Y": r["worst_1y"],
+            "Down years": r["loss_years"],
+            "Years to double": r["double"],
+        })
+    risk_df = pd.DataFrame(risk_rows)
+    st.dataframe(
+        styled_table(
+            risk_df,
+            {c: fmt_pct for c in ["Price CAGR", "Volatility (ann.)", "Max drawdown",
+                                  "Best 1Y", "Worst 1Y"]}
+            | {"Years to double": lambda v: f"{v:.1f}", "Down years": lambda v: f"{int(v)}"},
+            signed=["Price CAGR", "Best 1Y", "Worst 1Y"],
+            swatches=color_by_label,
+        ),
+        width="stretch", hide_index=True,
+    )
+
+    st.markdown("##### Drawdown from previous peak")
+    dd = go.Figure()
+    dd_floor = 0.0
+    for a in assets:
+        s = series[a]
+        drawdown = (s / s.cummax() - 1) * 100
+        dd_floor = min(dd_floor, drawdown.min())
+        dd.add_trace(go.Scatter(
+            x=s.index, y=drawdown, name=LABEL[a], mode="lines",
+            line=dict(color=COLOR[a], width=1.5, dash="dot" if a == "Index" else "solid"),
+            hovertemplate=f"{LABEL[a]}: %{{y:.1f}}%<extra></extra>",
+        ))
+    dd.update_layout(
+        **(CHART_LAYOUT | {"margin": dict(l=8, r=8, t=56, b=8)}),
+        height=360,
+        yaxis=dict(ticksuffix="%", gridcolor=GRID_COLOR, zeroline=True,
+                   range=[dd_floor * 1.08 - 1, 2],
+                   zerolinecolor="rgba(0,0,0,0.25)", automargin=True),
+        xaxis=dict(showgrid=False, automargin=True),
+    )
+    st.plotly_chart(dd, width="stretch", theme=None, config={"displaylogo": False})
+
+    with st.expander("How these are calculated"):
+        st.markdown(
+            "All risk figures use each fund's own daily NAVs within the selected period, "
+            "independent of the investment mode.\n\n"
+            "- **Price CAGR** — annualised growth of the NAV (or index level).\n"
+            "- **Volatility** — standard deviation of daily returns × √252.\n"
+            "- **Max drawdown** — the largest fall from a previous peak.\n"
+            "- **Best / worst 1Y** — range of returns over every rolling 12-month window.\n"
+            "- **Down years** — calendar years that ended lower than the previous year-end.\n"
+            "- **Years to double** — ln 2 ÷ ln(1 + CAGR), at the period's CAGR."
+        )
+
+# --- Goal planner ------------------------------------------------------------
+with tab_plan:
+    g1, g2, _ = st.columns([1, 1, 2])
+    goal = g1.number_input("Target corpus (₹)", min_value=10_000, value=1_00_00_000,
+                           step=1_00_000)
+    g1.caption(fmt_inr(goal))
+    horizon = g2.number_input("Years to goal", min_value=1, max_value=50, value=10)
+    goal_nominal = goal * (1 + inflation / 100) ** horizon if real_terms else goal
+    n = int(horizon * 12)
+
+    plan_rows = []
+    for a in assets:
+        cagr = price_cagr(series[a])
+        if pd.isna(cagr) or cagr <= 0:
+            sip = np.nan  # no meaningful projection from a flat or negative return
+        else:
+            r = (1 + cagr / 100) ** (1 / 12) - 1
+            # Future value of an annuity due: FV = P × ((1+r)^n − 1) / r × (1+r)
+            sip = goal_nominal * r / (((1 + r) ** n - 1) * (1 + r))
+        plan_rows.append({
+            "Fund": LABEL[a] + (" (benchmark)" if a == "Index" else ""),
+            f"CAGR ({period_label})": cagr,
+            "Monthly SIP needed": sip,
+            "Total you invest": sip * n,
+        })
+    st.dataframe(
+        styled_table(
+            pd.DataFrame(plan_rows),
+            {f"CAGR ({period_label})": fmt_pct, "Monthly SIP needed": fmt_inr,
+             "Total you invest": fmt_inr},
+            signed=[f"CAGR ({period_label})"],
+            swatches=color_by_label,
+        ),
+        width="stretch", hide_index=True,
+    )
+    note = (f"Assumes each fund repeats its {period_label} CAGR and a flat SIP at the start "
+            "of each month. Funds with a zero or negative CAGR are left blank.")
+    if real_terms:
+        note += (f" The target is in today's rupees, grossed up at {inflation}% inflation to "
+                 f"{fmt_inr(goal_nominal)}; tax is not deducted.")
+    if (end_dt - start_dt).days < 365:
+        note += " Periods under a year give unreliable CAGRs — pick 3Y or longer."
+    st.caption(note + " Past returns do not guarantee future returns.")
+
+# --- News --------------------------------------------------------------------
+with tab_news:
+    groups = defaultdict(list)
+    queries = {}
+    for f in funds:
+        q, label = fund_theme(f)
+        groups[label].append(f)
+        queries[label] = q
+
+    news_cols = st.columns(min(len(groups), 2))
+    for i, (label, members) in enumerate(groups.items()):
+        with news_cols[i % len(news_cols)]:
+            st.markdown(f"##### {label}")
+            st.markdown(
+                " ".join(f'<span class="mfga-swatch" style="background:{COLOR[f]}"></span>'
+                         f'<span class="mfga-meta">{LABEL[f]}</span>&nbsp;&nbsp;' for f in members),
+                unsafe_allow_html=True,
+            )
+            try:
+                articles = fetch_news(queries[label])
+            except Exception as exc:
+                st.caption(f"News unavailable ({exc.__class__.__name__}).")
+                continue
+            if not articles:
+                st.caption("No recent articles.")
+            for art in articles:
+                title = html.escape(art["title"])
+                url = html.escape(art["url"], quote=True)
+                meta = " · ".join(x for x in [art["source"], art["date"]] if x)
+                st.markdown(
+                    f'<div class="mfga-news"><a href="{url}" target="_blank" '
+                    f'rel="noopener">{title}</a><div class="mfga-meta">{meta}</div></div>',
+                    unsafe_allow_html=True,
+                )
+    st.caption("Headlines are matched to each fund's theme by keywords in its name and "
+               "refresh hourly.")
+
+st.divider()
+st.caption(
+    f"Data: AMFI and mfapi.in (NAV), Yahoo Finance (index). Latest data point "
+    f"{max_date:%d %b %Y}. For education only — not investment advice."
+)

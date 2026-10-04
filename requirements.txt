@@ -1,5 +1,6 @@
-streamlit
-pandas
+streamlit>=1.45
+pandas>=2.2
+numpy
 plotly
+requests
 yfinance
-duckduckgo-search

@@ -457,7 +457,7 @@ def fetch_news(query: str, limit: int = 6) -> list[dict]:
 # Page setup
 # =============================================================================
 
-st.set_page_config(page_title="MF Growth Analyser", layout="wide")
+st.set_page_config(page_title="Mutual Funds Growth Analyser", layout="wide")
 
 st.markdown(
     """
@@ -488,7 +488,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("MF Growth Analyser")
+st.title("Mutual Funds Growth Analyser")
 st.markdown(
     '<p class="mfga-sub">Back-test Indian mutual funds against a market index '
     "with lumpsum or SIP investing, using daily NAVs from AMFI.</p>",
